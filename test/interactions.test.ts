@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { memoryLog } from './memory-log.ts';
 import {
   ADMIN_COMMAND_DEFINITIONS,
   checkOptions,
@@ -37,6 +38,9 @@ const signed = async (payload: unknown, timestamp = String(NOW_MS / 1000)) => {
 const statusCommand = { type: 2, application_id: '111', token: 'tok', data: { name: 'serverstatus' } };
 const embed = { title: 'UK Wardogs #1', description: '🟢 **Live** · **24/98** players', color: 1 };
 
+const failedWith = (text: string) =>
+  expect.objectContaining({ level: 'error', error: expect.objectContaining({ message: expect.stringContaining(text) }) });
+
 const deps = () => ({
   publicKey,
   runCommand: vi.fn(async (_request: CommandRequest) => ({ embeds: [embed] })),
@@ -44,7 +48,7 @@ const deps = () => ({
   editReply: vi.fn(async () => undefined),
   deleteReply: vi.fn(async () => undefined),
   privateFollowUp: vi.fn(async () => undefined),
-  log: { error: vi.fn() },
+  ...memoryLog(),
   now: () => NOW_MS,
   adminGuildId: '777' as string | undefined,
   adminRoleIds: ['555'],
@@ -112,7 +116,7 @@ describe('handleInteraction', () => {
     expect(d.deleteReply).toHaveBeenCalledWith('111', 'tok');
     expect(d.privateFollowUp).toHaveBeenCalledWith('111', 'tok', failureReply);
     expect(d.editReply).not.toHaveBeenCalled();
-    expect(d.log.error).toHaveBeenCalledWith(expect.stringContaining('timed out'));
+    expect(d.events).toContainEqual(failedWith('timed out'));
   });
 
   it.each(['players', 'lastmatch', 'rotation', 'roundup'])('keeps a failed /%s private too', async (name) => {
@@ -148,7 +152,7 @@ describe('handleInteraction', () => {
 
     expect(d.privateFollowUp).not.toHaveBeenCalled();
     expect(d.editReply).toHaveBeenCalledWith('111', 'tok', failureReply);
-    expect(d.log.error).toHaveBeenCalledWith(expect.stringContaining('would not delete'));
+    expect(d.events).toContainEqual(failedWith('would not delete'));
   });
 
   it('sends the private follow-up if a delete that seemed to fail went through, leaving nothing to edit', async () => {
@@ -162,7 +166,7 @@ describe('handleInteraction', () => {
 
     expect(d.editReply).toHaveBeenCalledWith('111', 'tok', failureReply);
     expect(d.privateFollowUp).toHaveBeenCalledWith('111', 'tok', failureReply);
-    expect(d.log.error).toHaveBeenCalledWith(expect.stringContaining('could not edit the public reply either'));
+    expect(d.events).toContainEqual(expect.objectContaining({ message: 'Command could not edit the public reply either', error: expect.objectContaining({ message: expect.stringContaining('404 Unknown Message') }) }));
   });
 
   it('cannot edit a reply it has already deleted, so a failed follow-up is logged and thrown', async () => {
@@ -176,7 +180,7 @@ describe('handleInteraction', () => {
     await expect(result.followUp?.()).rejects.toThrow(/private follow-up: 500/);
     expect(d.deleteReply).toHaveBeenCalledTimes(1);
     expect(d.editReply).not.toHaveBeenCalled();
-    expect(d.log.error).toHaveBeenCalledWith(expect.stringContaining('private follow-up: 500'));
+    expect(d.events).toContainEqual(failedWith('private follow-up: 500'));
   });
 
   it.each(['players', 'lastmatch', 'rotation', 'roundup'])('defers /%s publicly and runs it', async (name) => {
@@ -518,7 +522,9 @@ describe('handleInteraction', () => {
       const result = await handleInteraction(body, signature, timestamp, d);
 
       expect(result.body).toEqual({ type: 8, data: { choices: [] } });
-      expect(d.log.error).toHaveBeenCalledWith('/removematch suggestions failed: storage unavailable');
+      expect(d.events).toContainEqual(
+        expect.objectContaining({ message: 'Command suggestions failed', meta: { command: 'removematch' }, error: expect.objectContaining({ message: 'storage unavailable' }) }),
+      );
     });
   });
 
@@ -917,14 +923,14 @@ describe('a press of a vote button', () => {
     expect(d.privateFollowUp).toHaveBeenCalledWith('111', 'tok', { content: 'You voted for **Bakurani**.', allowed_mentions: { parse: [] } });
   });
 
-  it("passes the voter's server name on, for the log of who voted for what", async () => {
+  it("passes the voter on without their server name, which is kept out of the logs", async () => {
     const d = { ...deps(), voteGuildId: '777', castVote: vi.fn(async () => ({ update: null, reply: 'ok' })) };
     const named = { ...press(), member: { nick: 'Ash', user: { id: '9001', username: 'ash_01' } } };
     const { body, signature, timestamp } = await signed(named);
 
     await handleInteraction(body, signature, timestamp, d);
 
-    expect(d.castVote).toHaveBeenCalledWith({ poll: '42', map: 'Kavkazi', userId: '9001', userName: 'Ash' });
+    expect(d.castVote).toHaveBeenCalledWith({ poll: '42', map: 'Kavkazi', userId: '9001' });
   });
 
   it('counts a time of day button as a vote on the time of day', async () => {
@@ -989,7 +995,7 @@ describe('a press of a vote button', () => {
     const result = await handleInteraction(body, signature, timestamp, d);
 
     expect(JSON.stringify(result.body)).toContain('could not be counted');
-    expect(d.log.error).toHaveBeenCalled();
+    expect(d.events).not.toEqual([]);
   });
 });
 

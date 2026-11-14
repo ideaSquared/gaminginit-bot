@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { DurableObject } from 'cloudflare:workers';
 import { isQuiet, withSeedCall } from './alerts.ts';
 import { loadConfig } from './config.ts';
+import { log } from './log.ts';
 import {
   castVote,
   inGameProblem,
@@ -29,7 +30,7 @@ import {
   parseRecentMaps,
   rainRecordFor,
   RAIN_KEY,
-  voteLogLine,
+  voteLogFields,
   voteLogMessage,
   voteProblemMessage,
   parseVoteAlerts,
@@ -1013,7 +1014,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       return loadConfig(stringVars(this.env));
     } catch (error) {
-      console.error(`Moderation log: ${errorText(error)}`);
+      log.error('Moderation log post setup failed', {}, error);
       return {
         modLogWebhookUrl: undefined,
         griefAlerts: false,
@@ -1029,25 +1030,25 @@ export class Watcher extends DurableObject<Env> {
   private counting = oneAtATime();
   private countAlert(kind: string, at: number, count = 1): Promise<void> {
     return this.counting(async () => {
-      const log = parseAlertLog(await this.ctx.storage.get(ALERT_LOG_KEY));
-      await this.ctx.storage.put(ALERT_LOG_KEY, countAlert(log, kind, at, count));
-    }).catch((error: unknown) => console.error(`Counting a ${kind} alert failed: ${errorText(error)}`));
+      const alertLog = parseAlertLog(await this.ctx.storage.get(ALERT_LOG_KEY));
+      await this.ctx.storage.put(ALERT_LOG_KEY, countAlert(alertLog, kind, at, count));
+    }).catch((error: unknown) => log.error('Counting an alert failed', { kind }, error));
   }
 
   // An outage confirmed or over (see outages.ts): logged for the review, and posted to the moderation log channel when
   // OUTAGE_ALERTS is on, in the background, so a slow Discord never holds up the check.
   private async tellOutage(event: OutageEvent): Promise<void> {
     const { outage } = event;
-    const log = parseOutageLog(await this.ctx.storage.get(OUTAGE_LOG_KEY));
-    await this.ctx.storage.put(OUTAGE_LOG_KEY, logOutage(log, event));
+    const outageLog = parseOutageLog(await this.ctx.storage.get(OUTAGE_LOG_KEY));
+    await this.ctx.storage.put(OUTAGE_LOG_KEY, logOutage(outageLog, event));
     const what = event.type === 'down' ? 'confirmed' : event.refilled ? 'over' : 'not over after the wait, no longer watched';
-    console.info(`Outage ${what}: ${outage.kind} from ${new Date(outage.at).toISOString()}, ${outage.before} players before`);
+    log.info('Outage noted', { kind: outage.kind, outcome: what, since: new Date(outage.at).toISOString(), playersBefore: outage.before });
     const { modLogWebhookUrl, outageAlerts, siteUrl } = this.posting();
     if (modLogWebhookUrl === undefined || !outageAlerts) return;
     this.ctx.waitUntil(
       postWebhook(modLogWebhookUrl, buildOutageAlert(event, siteUrl))
         .then(() => this.countAlert(event.type === 'down' ? 'down' : 'up', event.at))
-        .catch((error: unknown) => console.error(`Outage alert failed: ${errorText(error)}`)),
+        .catch((error: unknown) => log.error('Outage alert failed', {}, error)),
     );
   }
 
@@ -1058,7 +1059,7 @@ export class Watcher extends DurableObject<Env> {
     if (modLogWebhookUrl === undefined) return;
     this.ctx.waitUntil(
       postWebhook(modLogWebhookUrl, buildModLogMessage(steamId, entry, siteUrl)).catch((error: unknown) =>
-        console.error(`Moderation log post failed (${entry.action} ${steamId}): ${errorText(error)}`),
+        log.error('Moderation log post failed', { action: entry.action }, error),
       ),
     );
   }
@@ -1069,10 +1070,7 @@ export class Watcher extends DurableObject<Env> {
   private postGriefAlerts(alerts: GriefAlert[]): void {
     const { modLogWebhookUrl, griefAlerts, siteUrl } = this.posting();
     for (const alert of alerts) {
-      console.info(
-        `Possible griefing: ${JSON.stringify(alert.name)} (${alert.steamId}) has ${alert.teamKills} team kills and ` +
-          `${alert.vehicleSuicides} vehicle suicides today`,
-      );
+      log.info('Possible griefing flagged', { teamKills: alert.teamKills, vehicleSuicides: alert.vehicleSuicides });
     }
     if (modLogWebhookUrl === undefined || !griefAlerts) return;
     this.ctx.waitUntil(
@@ -1082,7 +1080,7 @@ export class Watcher extends DurableObject<Env> {
           alerts.map((alert) =>
             postWebhook(modLogWebhookUrl, buildGriefAlert(alert, weaponName, siteUrl, steam.get(alert.steamId) ?? null))
               .then(() => this.countAlert('grief', Date.now()))
-              .catch((error: unknown) => console.error(`Griefing alert failed (${alert.steamId}): ${errorText(error)}`)),
+              .catch((error: unknown) => log.error('Griefing alert failed', {}, error)),
           ),
         );
       })(),
@@ -1103,7 +1101,7 @@ export class Watcher extends DurableObject<Env> {
             try {
               await messagePlayer(config.rconUrl, config.rconPassword, k.steamId, text, http);
             } catch (error) {
-              console.error(`Team kill warning for ${JSON.stringify(k.name)} (${k.steamId}) failed: ${errorText(error)}`);
+              log.error('Team kill warning failed', {}, error);
               return;
             }
             // In their history like a staff member's /warn, but not posted to the moderation log.
@@ -1111,10 +1109,10 @@ export class Watcher extends DurableObject<Env> {
               k.steamId,
               { action: 'warn', at: Date.now(), by: 'bot', name: k.name, reason: TEAM_KILL_WARNING, detail: 'Team kill' },
               { quiet: true },
-            ).catch((error: unknown) => console.error(`Team kill warning log for ${k.steamId} failed: ${errorText(error)}`));
+            ).catch((error: unknown) => log.error('Team kill warning log failed', {}, error));
           }),
         );
-      })().catch((error: unknown) => console.error(`Team kill warnings failed: ${errorText(error)}`)),
+      })().catch((error: unknown) => log.error('Team kill warnings failed', {}, error)),
     );
   }
 
@@ -1151,7 +1149,7 @@ export class Watcher extends DurableObject<Env> {
       }
       if (alarm === null) await storage.setAlarm(Date.now() + JOIN_CHECK_MS);
     } catch (error) {
-      console.error(`Starting join checks failed: ${errorText(error)}`);
+      log.error('Starting join checks failed', {}, error);
     }
   }
 
@@ -1164,7 +1162,7 @@ export class Watcher extends DurableObject<Env> {
       fetchPlayers: () => fetchPlayers(config.rconUrl, config.rconPassword, http),
       broadcast: (message) => sendBroadcast(config.rconUrl, config.rconPassword, message, http),
       now: Date.now,
-      log: console,
+      log,
       store: this.stateStore(),
       lines: () => this.lines(),
     });
@@ -1183,13 +1181,13 @@ export class Watcher extends DurableObject<Env> {
   private async feedJoined(presence: FeedPresence[], at: number): Promise<void> {
     try {
       const { config } = this.rcon();
-      const noteJoins = createFeedJoins({ config, log: console, store: this.stateStore() });
+      const noteJoins = createFeedJoins({ config, log, store: this.stateStore() });
       const due = await this.alerting(() => noteJoins(presence, presence.at(-1)?.players ?? null, at));
       if (due === null) return;
       const alarm = await this.ctx.storage.getAlarm();
       if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
     } catch (error) {
-      console.error(`Kill feed joins failed: ${errorText(error)}`);
+      log.error('Kill feed joins failed', {}, error);
     }
   }
 
@@ -1216,7 +1214,7 @@ export class Watcher extends DurableObject<Env> {
       fetchSnapshot: () => fetchSnapshot(config.rconUrl, config.rconPassword, http),
       messagePlayer: (steamId, text) => messagePlayer(config.rconUrl, config.rconPassword, steamId, text, http),
       now: Date.now,
-      log: console,
+      log,
       store: this.stateStore(),
       lines: () => this.lines(),
       privateProfiles: () => this.privateSteam(),
@@ -1236,7 +1234,7 @@ export class Watcher extends DurableObject<Env> {
     this.ctx.waitUntil(
       fetchStatus(config.rconUrl, config.rconPassword, http)
         .then((status) => this.updateMapVote(config, { status, players: [] }))
-        .catch((error: unknown) => console.error(`Map vote at the end of the match failed: ${errorText(error)}`)),
+        .catch((error: unknown) => log.error('Map vote at the end of the match failed', {}, error)),
     );
   }
 
@@ -1276,7 +1274,7 @@ export class Watcher extends DurableObject<Env> {
     if (joins.added.length > 0) this.recordSessions(joins.added, observation.at);
     if (!observation.seeding && observation.phase !== 'empty') {
       await this.coinPlay(observation.players, minutes, observation.at).catch((error: unknown) =>
-        console.error(`INITcoins: paying playing time failed: ${errorText(error)}`),
+        log.error('INITcoins: paying playing time failed', {}, error),
       );
     }
   }
@@ -1309,14 +1307,14 @@ export class Watcher extends DurableObject<Env> {
       });
       this.sessionsPrunedOn = day;
     } catch (error) {
-      console.error(`Staff page session records failed: ${errorText(error)}`);
+      log.error('Staff page session records failed', {}, error);
     }
   }
 
   private async recordSeed(seeders: SeedCredit[], at: number, minMinutes: number): Promise<void> {
     const dayKey = playerDayKey(at);
     await this.ctx.storage.put(dayKey, recordSeed(parsePlayerDay(await this.ctx.storage.get(dayKey)), seeders, minMinutes));
-    await this.coinSeed(seeders, at, minMinutes).catch((error: unknown) => console.error(`INITcoins: paying seeders failed: ${errorText(error)}`));
+    await this.coinSeed(seeders, at, minMinutes).catch((error: unknown) => log.error('INITcoins: paying seeders failed', {}, error));
   }
 
   // The match, the recent matches list and the players' totals are written together, and only once per match. Gives
@@ -1334,7 +1332,7 @@ export class Watcher extends DurableObject<Env> {
       [dayKey]: recordMatchPlayers(parsePlayerDay(stored.get(dayKey)), match),
     });
     await this.coinMatch(match, at, this.rcon().config.scoreToWin).catch((error: unknown) =>
-      console.error(`INITcoins: paying the match failed: ${errorText(error)}`),
+      log.error('INITcoins: paying the match failed', {}, error),
     );
     return at;
   }
@@ -1378,9 +1376,9 @@ export class Watcher extends DurableObject<Env> {
       await storage.put({ ...(recent > 0 ? { stats: { ...stats, matches } } : {}), winsSettled: true });
       this.matchCache.clear();
       this.winsSettled = true;
-      console.info(`Settled wins saved one point short: ${records} match records, ${recent} recent matches`);
+      log.info('Settled wins saved one point short', { records, recent });
     } catch (error) {
-      console.error(`Settling saved wins failed: ${errorText(error)}`);
+      log.error('Settling saved wins failed', {}, error);
     }
   }
 
@@ -1399,7 +1397,7 @@ export class Watcher extends DurableObject<Env> {
       broadcast: (message) => sendBroadcast(config.rconUrl, config.rconPassword, message, socketHttp(connect)),
       messagePlayer: (steamId, text) => messagePlayer(config.rconUrl, config.rconPassword, steamId, text, socketHttp(connect)),
       now: Date.now,
-      log: console,
+      log,
       store: this.stateStore(),
       lines: () => this.lines(),
       staff: () => this.staffSteam(),
@@ -1432,10 +1430,10 @@ export class Watcher extends DurableObject<Env> {
     await this.serial(() => this.watchBans(config, seen.snapshot));
     await this.serial(() => this.rollupLifetime(Date.now()));
     await this.serial(() => this.updateVip(config));
-    await this.coinDrain().catch((error: unknown) => console.error(`INITcoins: paying waiting awards failed: ${errorText(error)}`));
-    await this.coinMigrate().catch((error: unknown) => console.error(`INITcoins: the move from automatic VIP failed: ${errorText(error)}`));
-    await this.coinBackfill().catch((error: unknown) => console.error(`INITcoins: paying the days before them failed: ${errorText(error)}`));
-    await this.coinKillsDue().catch((error: unknown) => console.error(`INITcoins: paying kills failed: ${errorText(error)}`));
+    await this.coinDrain().catch((error: unknown) => log.error('INITcoins: paying waiting awards failed', {}, error));
+    await this.coinMigrate().catch((error: unknown) => log.error('INITcoins: the move from automatic VIP failed', {}, error));
+    await this.coinBackfill().catch((error: unknown) => log.error('INITcoins: paying the days before them failed', {}, error));
+    await this.coinKillsDue().catch((error: unknown) => log.error('INITcoins: paying kills failed', {}, error));
     await this.payBounties();
     await this.keepAccounts(config);
     await this.askBack(config, seen.snapshot);
@@ -1447,7 +1445,7 @@ export class Watcher extends DurableObject<Env> {
     await this.checkHeadshots(seen.snapshot);
     await this.checkAutoFlags(seen.snapshot);
     await this.watchFeed(config, seen.snapshot);
-    await this.chatLocked(() => this.moderateChat(config)).catch((error: unknown) => console.error(`Chat moderation failed: ${errorText(error)}`));
+    await this.chatLocked(() => this.moderateChat(config)).catch((error: unknown) => log.error('Chat moderation failed', {}, error));
 
     const { inviteCode } = config;
     const { botToken } = config.accounts;
@@ -1459,7 +1457,7 @@ export class Watcher extends DurableObject<Env> {
         const counts = await this.discordCounts(asBot ? { botToken, guildId } : null, inviteCode);
         await this.updateStats((stats) => recordDiscord(stats, counts));
       } catch (error) {
-        console.error(`Discord member count failed: ${error instanceof Error ? error.message : String(error)}`);
+        log.error('Discord member count failed', {}, error);
       }
     }
     await this.roundingUp(() => this.postRoundups(config));
@@ -1474,7 +1472,7 @@ export class Watcher extends DurableObject<Env> {
       return await fetchGuildCounts(bot.botToken, bot.guildId, Date.now());
     } catch (error) {
       if (!inviteCode) throw error;
-      console.error(`Discord member count: the server lookup failed, using the invite: ${error instanceof Error ? error.message : String(error)}`);
+      log.error('Discord member count: the server lookup failed, using the invite', {}, error);
       return fetchInviteCounts(inviteCode, Date.now());
     }
   }
@@ -1490,25 +1488,24 @@ export class Watcher extends DurableObject<Env> {
     try {
       let posted = parseRoundupsPosted(await storage.get('roundups'));
       for (const period of dueRoundups(posted, now, rule.hour)) {
-        const label = `${period.kind === 'week' ? 'weekly' : 'monthly'} roundup from ${dayOf(period.start)}`;
         try {
           const roundup = await this.roundupFor(period, now);
           if (roundup !== null) await postWebhook(rule.webhookUrl, buildRoundupMessage(roundup, config.siteUrl, await this.roundupUsers(roundup)));
           posted = markPosted(posted, period);
           await storage.put('roundups', posted);
-          console.info(roundup === null ? `No ${label}: nobody played` : `Posted the ${label}`);
+          log.info(roundup === null ? 'Roundup skipped: nobody played' : 'Roundup posted', { period: period.kind, from: dayOf(period.start) });
           // After the roundup is saved as posted, so a drive that fails never posts the roundup twice. It is not tried again.
           try {
             await this.postDrive(config, period, now, rule.webhookUrl);
           } catch (error) {
-            console.error(`The ${period.kind === 'week' ? 'weekly challenge' : 'player of the month'} after the ${label} failed: ${errorText(error)}`);
+            log.error('The drive after the roundup failed', { period: period.kind }, error);
           }
         } catch (error) {
-          console.error(`The ${label} failed, trying again next check: ${errorText(error)}`);
+          log.error('Roundup failed, trying again next check', { period: period.kind, from: dayOf(period.start) }, error);
         }
       }
     } catch (error) {
-      console.error(`Roundups failed: ${errorText(error)}`);
+      log.error('Roundups failed', {}, error);
     }
   }
 
@@ -1540,7 +1537,7 @@ export class Watcher extends DurableObject<Env> {
       const moved = await this.moveRole(config, playerOfMonthRoleId, drives.month, winner.steamId);
       await storage.put(DRIVES_KEY, { ...drives, month: moved.holder, stale: [...drives.stale, ...moved.stale] });
       await postWebhook(webhookUrl, buildPlayerOfMonthMessage(period.start, winner, hidden, moved.outcome, playerOfMonthRoleId, config.siteUrl));
-      console.info(`Posted the player of the month: ${JSON.stringify(winner.name)} (${winner.steamId}), role ${moved.outcome}`);
+      log.info('Player of the month posted', { outcome: moved.outcome });
       return;
     }
     // A winner only for a challenge people were told of.
@@ -1559,7 +1556,7 @@ export class Watcher extends DurableObject<Env> {
     );
     // Only once people were told of it, so its winner is named next week.
     await storage.put(DRIVES_KEY, { ...held, announced: dayOf(period.end) });
-    console.info(`Posted the weekly challenge: ${next.id}${winner === null ? '' : `, last week's won by ${JSON.stringify(winner.name)} (${winner.steamId})`}`);
+    log.info('Weekly challenge posted', { challengeId: next.id, hadWinner: winner !== null });
   }
 
   // The bot's token and the server, when it can give roles.
@@ -1578,7 +1575,7 @@ export class Watcher extends DurableObject<Env> {
       try {
         await setRole(giver.botToken, giver.guildId, role.userId, role.roleId, false);
       } catch (error) {
-        console.error(`Taking role ${role.roleId} from ${role.userId} failed again: ${errorText(error)}`);
+        log.error('Taking a role failed again', { roleId: role.roleId }, error);
         left.push(role);
       }
     }
@@ -1603,7 +1600,7 @@ export class Watcher extends DurableObject<Env> {
       try {
         await setRole(giver.botToken, giver.guildId, previous.userId, roleId, false);
       } catch (error) {
-        console.error(`Taking role ${roleId} from ${previous.userId} failed, trying again after the next roundup: ${errorText(error)}`);
+        log.error('Taking a role failed, trying again after the next roundup', { roleId }, error);
         stale.push({ userId: previous.userId, roleId });
       }
     }
@@ -1612,7 +1609,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       return { holder, outcome: (await setRole(giver.botToken, giver.guildId, userId, roleId, true)) === 'done' ? 'given' : 'unlinked', stale };
     } catch (error) {
-      console.error(`Giving role ${roleId} to ${userId} failed: ${errorText(error)}`);
+      log.error('Giving a role failed', { roleId }, error);
       return { holder, outcome: 'none', stale };
     }
   }
@@ -1640,7 +1637,7 @@ export class Watcher extends DurableObject<Env> {
       const users = await discordUsers(this.bookStorage(), wanted);
       return new Map([...users].flatMap(([steamId, user]) => (this.ids.has(steamId) ? [[this.ids.get(steamId)!, user] as const] : [])));
     } catch (error) {
-      console.error(`Roundup tags failed: ${errorText(error)}`);
+      log.error('Roundup tags failed', {}, error);
       return new Map();
     }
   }
@@ -1654,7 +1651,7 @@ export class Watcher extends DurableObject<Env> {
       if (since === null) return null;
       return { since, kills: [...this.killSummaries(sql, covered, now).values()].flat() };
     } catch (error) {
-      console.error(`Roundup awards failed: ${errorText(error)}`);
+      log.error('Roundup awards failed', {}, error);
       return null;
     }
   }
@@ -1696,7 +1693,7 @@ export class Watcher extends DurableObject<Env> {
     const roundup = await this.seasonRoundup(season, now);
     if (roundup !== null && season.endsAt !== null && now >= season.endsAt + SEASON_SETTLE_MS) {
       await storage.put(seasonKey(season.number), keptSeason(roundup));
-      console.info(`Kept the ${season.name} roundup`);
+      log.info('Season roundup kept', { season: season.number });
     }
     return roundup;
   }
@@ -1714,7 +1711,7 @@ export class Watcher extends DurableObject<Env> {
         await this.announceSeason(config, season, roundup, now);
         this.seasonsLooked.add(season.number);
       } catch (error) {
-        console.error(`Keeping the ${season.name} roundup failed: ${errorText(error)}`);
+        log.error('Keeping the season roundup failed', { season: season.number }, error);
       }
     }
   }
@@ -1736,9 +1733,9 @@ export class Watcher extends DurableObject<Env> {
       const seasonUrl = site === undefined ? undefined : `${site}/season?number=${season.number}`;
       const webhookUrl = config.roundups?.webhookUrl ?? config.webhookUrl;
       await postWebhook(webhookUrl, buildSeasonMessage(season.name, shown, seasonUrl, config.siteUrl, await this.roundupUsers(shown)));
-      console.info(`Announced the ${season.name} roundup`);
+      log.info('Season roundup announced', { season: season.number });
     } catch (error) {
-      console.error(`Announcing the ${season.name} roundup failed: ${errorText(error)}`);
+      log.error('Announcing the season roundup failed', { season: season.number }, error);
     }
   }
 
@@ -1826,10 +1823,10 @@ export class Watcher extends DurableObject<Env> {
       const shown = await showBoard(webhookUrl, message, ref);
       if (shown.messageId !== ref?.messageId) {
         await storage.put('board', shown);
-        console.info(`Posted the live status (message ${shown.messageId})`);
+        log.info('Live status posted', { messageId: shown.messageId });
       }
     } catch (error) {
-      console.error(`Live status update failed: ${errorText(error)}`);
+      log.error('Live status update failed', {}, error);
     }
   }
 
@@ -1850,7 +1847,7 @@ export class Watcher extends DurableObject<Env> {
       const zone = zoneOfSlot(rotation, status);
       await storage.put(MATCH_ZONE_KEY, withMatchZone(notes, { startedAt, ...(zone ? { zone } : {}) }));
     } catch (error) {
-      console.error(`Noting the match's circles failed: ${errorText(error)}`);
+      log.error("Noting the match's circles failed", {}, error);
     }
   }
 
@@ -1876,7 +1873,7 @@ export class Watcher extends DurableObject<Env> {
       if (book !== saved) await this.ctx.storage.put('rotations', book);
       if (rotationToday(book, today)?.pending) await this.sendRotation(book, config);
     } catch (error) {
-      console.error(`Map rotation update failed: ${errorText(error)}`);
+      log.error('Map rotation update failed', {}, error);
     }
   }
 
@@ -1891,7 +1888,6 @@ export class Watcher extends DurableObject<Env> {
       await this.ctx.storage.put('rotations', done);
       return { book: done, server: null };
     }
-    const who = applied.by === 'schedule' ? 'the schedule' : `Discord user ${applied.by}`;
     try {
       const { rconUrl, rconPassword } = config;
       const http = socketHttp(connect);
@@ -1916,14 +1912,12 @@ export class Watcher extends DurableObject<Env> {
         : put.next === null
           ? ", as it is, as the server didn't say which slot it is on"
           : `, starting with ${put.next.map} at the next map change`;
-      console.info(
-        put.written
-          ? `Map rotation: put ${JSON.stringify(rotation.name)} (${rotation.entries.length} maps) on the server for ${applied.day}, chosen by ${who}${next}`
-          : `Map rotation: the server already has ${JSON.stringify(rotation.name)}`,
-      );
+      (put.written
+        ? log.info('Map rotation put on the server', { rotation: rotation.name, maps: rotation.entries.length, day: applied.day, via: applied.by === 'schedule' ? 'schedule' : 'staff', nextMap: put.next?.map ?? null })
+        : log.info('Map rotation already on the server', { rotation: rotation.name }));
       return { book: done, server: { outcome: put.written ? 'updated' : 'unchanged' } };
     } catch (error) {
-      console.error(`Map rotation: couldn't put ${JSON.stringify(rotation.name)} on the server, trying again next check: ${errorText(error)}`);
+      log.error('Map rotation: could not put the rotation on the server, trying again next check', { rotation: rotation.name }, error);
       return { book, server: { outcome: 'failed', reason: errorText(error) } };
     }
   }
@@ -1945,7 +1939,7 @@ export class Watcher extends DurableObject<Env> {
     const book = seedDefault(named, entries);
     if (book === saved) return saved;
     await this.ctx.storage.put('rotations', book);
-    console.info(`Map rotation: saved the server's rotation as ${DEFAULT_ROTATION} (${entries.length} maps)`);
+    log.info("Map rotation: saved the server's rotation as the default", { rotation: DEFAULT_ROTATION, maps: entries.length });
     return book;
   }
 
@@ -1970,7 +1964,6 @@ export class Watcher extends DurableObject<Env> {
     light?: string;
     weather?: string;
     userId: string;
-    userName?: string;
     via?: string;
   }): Promise<{ update: unknown | null; reply: string }> {
     const config = loadConfig(stringVars(this.env));
@@ -2002,7 +1995,7 @@ export class Watcher extends DurableObject<Env> {
         return { update: null, reply: cast.result === 'closed' ? 'The vote has closed.' : 'That choice is not in this vote.' };
       }
       await this.ctx.storage.put(MAP_VOTE_KEY, cast.vote);
-      console.info(voteLogLine(cast.vote, press, vote.ballots.find((b) => b.user === press.userId)));
+      log.info('Map vote counted', voteLogFields(cast.vote, press, vote.ballots.find((b) => b.user === press.userId)));
       const name =
         press.map !== undefined
           ? (cast.vote.options.find((o) => o.map === press.map)?.name ?? mapName(press.map))
@@ -2024,7 +2017,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       await editVoteMessage(rule.botToken, vote.message.channelId, vote.message.messageId, voteMessage(vote, Date.now(), config.siteUrl));
     } catch (error) {
-      console.error(`Map vote: could not update the Discord message: ${errorText(error)}`);
+      log.error('Map vote: could not update the Discord message', {}, error);
     }
   }
 
@@ -2035,13 +2028,13 @@ export class Watcher extends DurableObject<Env> {
     if (snapshot === null || snapshot.status.map === '') return;
     // Whether or not there is a vote now: a winner put in the rotation is taken out once it is playing.
     await this.voting(() => this.restoreVoteInsert(config, snapshot.status.map)).catch((error: unknown) =>
-      console.error(`Map vote: restoring the rotation failed: ${errorText(error)}`),
+      log.error('Map vote: restoring the rotation failed', {}, error),
     );
     if (rule === null) return;
     try {
       await this.voting(() => this.stepMapVote(config, rule, snapshot.status.map));
     } catch (error) {
-      console.error(`Map vote failed: ${errorText(error)}`);
+      log.error('Map vote failed', {}, error);
     }
   }
 
@@ -2075,8 +2068,8 @@ export class Watcher extends DurableObject<Env> {
           ]);
         }
         vote = await save(ended(vote, { at: now, winner: null, pending: false, note: NOTE.late }));
-        if (lost === null) console.info(`Map vote: the match ended before the vote could be applied`);
-        else console.error(`Map vote: the match ended before the vote could be applied, so ${lost} was not put on the server`);
+        if (lost === null) log.info('Map vote: the match ended before the vote could be applied');
+        else log.error('Map vote: the match ended before the winner could be put on the server', { map: lost });
         await this.showVote(config, rule, vote);
       }
       vote = null;
@@ -2102,12 +2095,12 @@ export class Watcher extends DurableObject<Env> {
                 },
           ),
         );
-        console.info(`Map vote closed: ${winner ?? 'no votes'} (${vote.ballots.length} ballots)${vote.rain.all ? ', no rain allowed' : ''}`);
+        log.info('Map vote closed', { map: winner ?? null, ballots: vote.ballots.length, noRain: Boolean(vote.rain.all) });
         await this.showVote(config, rule, vote);
         // Every ballot in one message for the moderation log, when the vote had any.
         if (config.modLogWebhookUrl !== undefined && vote.ballots.length > 0) {
           postWebhook(config.modLogWebhookUrl, voteLogMessage(vote)).catch((error: unknown) =>
-            console.error(`Map vote: could not post the ballots to the moderation log: ${errorText(error)}`),
+            log.error('Map vote: could not post the ballots to the moderation log', {}, error),
           );
         }
       }
@@ -2124,7 +2117,7 @@ export class Watcher extends DurableObject<Env> {
     // A match that is live and has no vote yet.
     if (match === null || !voteCanOpen(match)) return;
     if (!rule.botToken || !rule.channelId) {
-      console.error('Map vote: MAP_VOTE is on, but DISCORD_BOT_TOKEN and DISCORD_VOTE_CHANNEL_ID are not both set, so no vote opens.');
+      log.error('Map vote: MAP_VOTE is on, but DISCORD_BOT_TOKEN and DISCORD_VOTE_CHANNEL_ID are not both set, so no vote opens');
       return;
     }
     const catalog = await this.catalog(config);
@@ -2149,12 +2142,14 @@ export class Watcher extends DurableObject<Env> {
         const maps = catalog?.maps ?? [];
         const withModes = maps.filter((m) => m.modes.length > 0);
         const withInfantry = withModes.filter((m) => m.modifiers.some((x) => x.key === 'infantry_only'));
-        console.error(
-          `Map vote: no vote opened, as fewer than two maps could be offered. The server lists ${maps.length} maps, ` +
-            `${withModes.length} with a game mode, ${withInfantry.length} of those with infantry only (${withInfantry.map((m) => m.id).join(', ') || 'none'}); ` +
-            `not offered because they were played lately: ${recent.join(', ')}` +
-            `${off.length > 0 ? `; switched off by staff with /voteoptions: ${off.join(', ')}` : ''}.`,
-        );
+        log.error('Map vote: no vote opened, as fewer than two maps could be offered', {
+          maps: maps.length,
+          withModes: withModes.length,
+          withInfantry: withInfantry.length,
+          infantryMaps: withInfantry.map((m) => m.id).join(', ') || 'none',
+          playedLately: recent.join(', '),
+          offMaps: off.join(', '),
+        });
       }
       return;
     }
@@ -2172,18 +2167,18 @@ export class Watcher extends DurableObject<Env> {
     });
     const messageId = await postVoteMessage(rule.botToken, rule.channelId, voteMessage(opened, now, config.siteUrl));
     await storage.put(MAP_VOTE_KEY, { ...opened, message: { channelId: rule.channelId, messageId } });
-    console.info(`Map vote opened: ${opened.options.map((o) => o.map).join(', ')}`);
+    log.info('Map vote opened', { maps: opened.options.map((o) => o.map).join(', ') });
     // Only the current vote is left in the channel. The new one is up first, and a failure here is only logged: the old
     // message is just clutter, and its vote is no longer kept to try again.
     if (previous?.message && previous.message.messageId !== messageId) {
       await deleteVoteMessage(rule.botToken, previous.message.channelId, previous.message.messageId).catch((error: unknown) =>
-        console.error(`Map vote: could not delete the last vote's message: ${errorText(error)}`),
+        log.error("Map vote: could not delete the last vote's message", {}, error),
       );
     }
     const announcement = voteOpenBroadcast(config.siteUrl, config.inviteCode ? discordLink(config.inviteCode) : null, opened.closeScore, rule.minutes);
     if (announcement !== null) {
       await sendBroadcast(config.rconUrl, config.rconPassword, announcement, socketHttp(connect)).catch((error: unknown) =>
-        console.error(`Map vote announcement failed: ${errorText(error)}`),
+        log.error('Map vote announcement failed', {}, error),
       );
     }
   }
@@ -2205,7 +2200,7 @@ export class Watcher extends DurableObject<Env> {
       await storage.put(RAIN_KEY, record);
       return record;
     } catch (error) {
-      console.error(`Map vote: could not tell if ${playing} is in the rain: ${errorText(error)}`);
+      log.error('Map vote: could not tell if the map is in the rain', { map: playing }, error);
       return null;
     }
   }
@@ -2227,11 +2222,11 @@ export class Watcher extends DurableObject<Env> {
       const slot = rotationSlot(rotation, status);
       const entry = playingEntry(rotation, slot);
       if (slot === null || entry === null) {
-        console.error(`Restart: the server is back on ${status.map}, but its rotation does not say which map is playing yet, so it is not checked for infantry only (tried again next check)`);
+        log.error('Restart: the server is back, but its rotation does not say which map is playing yet, so it is not checked for infantry only (tried again next check)', { map: status.map });
         return;
       }
       if (isInfantryOnly(entry.experiences)) {
-        console.info(`Restart: the server is back on ${entry.map}, infantry only`);
+        log.info('Restart: the server is back on an infantry only map', { map: entry.map });
         await storage.put(RESTART_WATCH_KEY, settled(watch));
         return;
       }
@@ -2252,16 +2247,16 @@ export class Watcher extends DurableObject<Env> {
         if ('problem' in planned) throw new Error(planned.problem);
         target = { map: choice.id, setup: planned.setup };
       }
-      console.info(`Restart: the server is back on ${playing}, which is not infantry only; changing to ${target.map} ${JSON.stringify(target.setup)}`);
+      log.info('Restart: the server is back on a map that is not infantry only, changing it', { map: playing, target: target.map, setup: JSON.stringify(target.setup) });
       await queueMap(rconUrl, rconPassword, target.map, http, target.setup);
       await this.stageNextMap(target.map, playing);
       await endMatch(rconUrl, rconPassword, http);
       await storage.put(RESTART_WATCH_KEY, settled(watch));
       await sendBroadcast(rconUrl, rconPassword, `Server restarted. Switching to ${mapName(target.map)}, infantry only. Hang tight!`, http).catch((error: unknown) =>
-        console.error(`Restart announcement failed: ${errorText(error)}`),
+        log.error('Restart announcement failed', {}, error),
       );
     } catch (error) {
-      console.error(`Restart: could not check the map for infantry only, trying again next check: ${errorText(error)}`);
+      log.error('Restart: could not check the map for infantry only, trying again next check', {}, error);
     }
   }
 
@@ -2275,10 +2270,10 @@ export class Watcher extends DurableObject<Env> {
       if (next === null) return;
       await this.ctx.storage.put(VOTE_ALERTS_KEY, next);
       postWebhook(url, voteProblemMessage(voteId, title, lines, Date.now())).catch((error: unknown) =>
-        console.error(`Map vote: could not post the problem to the moderation log: ${errorText(error)}`),
+        log.error('Map vote: could not post the problem to the moderation log', {}, error),
       );
     } catch (error) {
-      console.error(`Map vote: could not note the problem for the moderation log: ${errorText(error)}`);
+      log.error('Map vote: could not note the problem for the moderation log', {}, error);
     }
   }
 
@@ -2358,16 +2353,16 @@ export class Watcher extends DurableObject<Env> {
       }
       await this.stageNextMap(winner, playing);
       if (picked !== null) await this.ctx.storage.put(LAST_ZONES_KEY, { ...lastZones, [winner]: picked.id });
-      console.info(`Map vote: ${winner} staged as the next map ${inserted === true ? 'in the rotation' : 'in the queue'}, ${JSON.stringify(planned.setup)}`);
+      log.info('Map vote: the winner is staged as the next map', { map: winner, staged: inserted === true ? 'rotation' : 'queue', setup: JSON.stringify(planned.setup) });
       const name = vote.options.find((o) => o.map === winner)?.name ?? mapName(winner);
       const votes = vote.ballots.filter((b) => b.map === winner).length;
       const setup = [vote.outcome?.lightingName, picked ? `${picked.name} zones` : null].filter((x): x is string => Boolean(x));
       await sendBroadcast(rconUrl, rconPassword, voteResultBroadcast(name, setup, votes), http).catch((error: unknown) =>
-        console.error(`Map vote result announcement failed: ${errorText(error)}`),
+        log.error('Map vote result announcement failed', {}, error),
       );
       return outcomeOf(false, at);
     } catch (error) {
-      console.error(`Map vote: could not stage ${winner}, trying again next check: ${errorText(error)}`);
+      log.error('Map vote: could not stage the winner, trying again next check', { map: winner }, error);
       await this.alertVoteProblem(config, vote.id, 'failed', "The winner couldn't be put on the server", [
         `**${mapName(winner)}** won the vote, but putting it on the server failed. The bot tries again every minute until the match ends.`,
         `\`${errorText(error)}\``,
@@ -2390,7 +2385,7 @@ export class Watcher extends DurableObject<Env> {
     const problem = whyNoInsert(rotation);
     if (problem !== null) return `${problem} (${rotationFacts(rotation, status)})`;
     const routes = await fetchRoutes(rconUrl, rconPassword, http).catch((error: unknown) => {
-      console.error(`Map vote: could not read the server's routes, so the rotation goes through the config document: ${errorText(error)}`);
+      log.error("Map vote: could not read the server's routes, so the rotation goes through the config document", {}, error);
       return [];
     });
     if (!canMoveEntries(routes)) return this.writeVoteWinner(config, vote, winner, rotation, status, slot);
@@ -2409,7 +2404,7 @@ export class Watcher extends DurableObject<Env> {
     for (let at = move.from; at !== move.to; at += step) await moveRotationEntry(rconUrl, rconPassword, at, step < 0 ? 'up' : 'down', http);
     // The live status reads the new rotation at the next check.
     await this.ctx.storage.delete('boardRotation');
-    console.info(`Map vote: ${winner.map} ${move.add ? 'added to' : 'moved in'} the rotation, into slot ${move.to} (${rotationFacts(rotation, status)})`);
+    log.info('Map vote: the winner is in the rotation', { map: winner.map, added: Boolean(move.add), slot: move.to, facts: rotationFacts(rotation, status) });
     return true;
   }
 
@@ -2452,7 +2447,7 @@ export class Watcher extends DurableObject<Env> {
     await write(plan);
     if (plan.asIs) {
       // An error in the Worker's logs, not info, so it stands out there and can be alerted on.
-      console.error(`Map vote: the server did not say which rotation slot it is on, so ${winner.map} is in every slot (${rotationFacts(rotation, status)})`);
+      log.error('Map vote: the server did not say which rotation slot it is on, so the winner is in every slot', { map: winner.map, facts: rotationFacts(rotation, status) });
       await this.alertVoteProblem(config, vote.id, 'every-slot', "The server didn't say which rotation slot it is on", [
         `**${mapName(winner.map)}** won the vote, but without the slot the server is on the bot can't put it after the map being played. It is in **every** slot of the rotation, so it plays next, and the map that would have come after it is skipped once.`,
         `The rotation is put back about ${RESTORE_MINUTES} minutes into the next match.`,
@@ -2466,9 +2461,11 @@ export class Watcher extends DurableObject<Env> {
     const every = planInsert(rotation, null, winner);
     if (every === null) return 'it cannot be planned';
     await write(every);
-    console.error(
-      `Map vote: after the write the server goes to ${after.entries[next]?.map ?? 'another map'} next, not ${winner.map}, so ${winner.map} is in every slot (${rotationFacts(after, afterStatus)})`,
-    );
+    log.error('Map vote: after the write the server goes to another map next, so the winner is in every slot', {
+      map: winner.map,
+      nextMap: after.entries[next]?.map ?? null,
+      facts: rotationFacts(after, afterStatus),
+    });
     await this.alertVoteProblem(config, vote.id, 'every-slot', 'The server went to the wrong slot after the rotation was written', [
       `**${mapName(winner.map)}** won the vote. After the write the server goes to **${mapName(after.entries[next]?.map ?? 'another map')}** next, so the winner is in **every** slot of the rotation instead, and the map that would have come after it is skipped once.`,
       `The rotation is put back about ${RESTORE_MINUTES} minutes into the next match.`,
@@ -2500,13 +2497,13 @@ export class Watcher extends DurableObject<Env> {
         const slot = insert.asIs ? null : rotationSlot(rotation, status);
         await putRotation({ ...this.settingsFile({ config, http }), slot: async () => slot }, insert.restore);
         await storage.delete('boardRotation');
-        console.info(`Map vote: the server is on ${playing}; the rotation is back as it was, from ${insert.restore[0]?.map ?? 'its start'}`);
+        log.info('Map vote: the rotation is back as it was', { map: playing, from: insert.restore[0]?.map ?? null });
       } else {
-        console.info(`Map vote: the rotation has changed since ${insert.map} was put in it, so it is left as it is`);
+        log.info('Map vote: the rotation has changed since the winner was put in it, so it is left as it is', { map: insert.map });
       }
       await storage.delete(VOTE_INSERT_KEY);
     } catch (error) {
-      console.error(`Map vote: could not put the rotation back, trying again next check: ${errorText(error)}`);
+      log.error('Map vote: could not put the rotation back, trying again next check', {}, error);
       await this.alertVoteProblem(config, insert.voteId, 'restore', "The rotation couldn't be put back", [
         `**${mapName(insert.map)}**, which won the vote, is still in the rotation. The bot tries again every minute.`,
         `\`${errorText(error)}\``,
@@ -2554,13 +2551,13 @@ export class Watcher extends DurableObject<Env> {
   async rotationsPage(): Promise<RotationsPage> {
     const config = loadConfig(stringVars(this.env));
     const book = await this.serial(() => this.ensureDefault(config)).catch(async (error: unknown) => {
-      console.error(`Map rotation: Default could not be set up: ${errorText(error)}`);
+      log.error('Map rotation: Default could not be set up', {}, error);
       return parseRotationBook(await this.ctx.storage.get('rotations'));
     });
     const [server, catalog] = await Promise.all([
       fetchRotation(config.rconUrl, config.rconPassword, socketHttp(connect)).catch(() => null),
       this.catalog(config).catch((error: unknown) => {
-        console.error(`Staff page: the maps could not be read: ${errorText(error)}`);
+        log.error('Staff page: the maps could not be read', {}, error);
         return null;
       }),
     ]);
@@ -2689,21 +2686,20 @@ export class Watcher extends DurableObject<Env> {
         const sent: RuleCall[] = [];
         for (const call of judged.calls) {
           const detail = callDetail(call);
-          const player = `${JSON.stringify(call.name)} (${call.steamId})`;
           try {
             if (call.act === 'kick') await kickPlayer(config.rconUrl, config.rconPassword, call.steamId, kickText(call.rule, context), http);
             else await messagePlayer(config.rconUrl, config.rconPassword, call.steamId, warningText(call.rule, call.offence, context), http);
-            console.info(`Weapon rule: ${call.act === 'kick' ? 'kicked' : 'warned'} ${player}. ${detail}`);
+            log.info('Weapon rule enforced', { action: call.act, rule: call.rule.name, kills: call.kills });
             sent.push(call);
             const reason = call.act === 'kick' ? call.rule.kick : call.rule.warning;
             await this.record(call.steamId, { action: call.act, at: now, by: 'bot', name: call.name, reason, detail });
           } catch (error) {
-            console.error(`Weapon rule ${call.act} for ${player} failed: ${errorText(error)}. ${detail}`);
+            log.error('Weapon rule action failed', { action: call.act, rule: call.rule.name }, error);
           }
         }
         // Batches are judged one at a time, so nothing else wrote the offences meanwhile.
         if (sent.length > 0) await this.ctx.storage.put(RULE_BREAKS_KEY, countSent(judged.breaks, sent));
-      }).catch((error: unknown) => console.error(`Weapon rules failed: ${errorText(error)}`)),
+      }).catch((error: unknown) => log.error('Weapon rules failed', {}, error)),
     );
   }
 
@@ -2753,7 +2749,7 @@ export class Watcher extends DurableObject<Env> {
   async chatFeed(after: number): Promise<ChatFeed> {
     const config = loadConfig(stringVars(this.env));
     if (config.chatMod && Date.now() - this.chatReadAt >= CHAT_LIVE_MS) {
-      await this.chatLocked(() => this.moderateChat(config)).catch((error: unknown) => console.error(`Chat moderation failed: ${errorText(error)}`));
+      await this.chatLocked(() => this.moderateChat(config)).catch((error: unknown) => log.error('Chat moderation failed', {}, error));
     }
     const state = parseChatState(await this.ctx.storage.get(CHAT_STATE_KEY));
     return chatFeed(state, after, { enabled: config.chatMod, available: this.chatRoute?.listed !== false });
@@ -2811,14 +2807,14 @@ export class Watcher extends DurableObject<Env> {
     const state = { ...reading.state, buffer: withVerdicts(reading.state.buffer, verdicts) };
     await this.ctx.storage.put(CHAT_STATE_KEY, state);
     if (reading.first) {
-      console.info(`Chat moderation: started at line ${state.cursor ?? 0}, with ${state.buffer.length} earlier lines kept and not acted on`);
+      log.info('Chat moderation: started, with earlier lines kept and not acted on', { lines: state.buffer.length });
     }
     const failed = new Map<number, Verdict>();
     for (const call of calls) {
       try {
         await this.actOnChat(config, http, call, now);
       } catch (error) {
-        console.error(`Chat moderation: ${call.kind} for ${JSON.stringify(call.line.name)} (${call.line.steamId ?? 'no Steam ID'}) failed: ${errorText(error)}. ${callEvidence(call)}`);
+        log.error('Chat moderation: acting on a line failed', { kind: call.kind, list: call.hit.list }, error);
         const was = verdicts.get(call.line.id);
         if (was !== undefined && call.kind !== 'alert') failed.set(call.line.id, { ...was, action: 'failed' });
       }
@@ -2843,7 +2839,7 @@ export class Watcher extends DurableObject<Env> {
         await messagePlayer(config.rconUrl, config.rconPassword, steamId, text, http);
         sent.set(lineId, kind);
       } catch (error) {
-        if (!isNotInGame(error)) console.error(`Chat moderation: could not send ${steamId} the ${kind === 'cheat' ? 'cheating report' : 'admin ticket'} reply: ${errorText(error)}`);
+        if (!isNotInGame(error)) log.error('Chat moderation: could not send the reply', { kind }, error);
       }
     }
     // Marked on the lines, so /chat and the live chat show staff that the bot answered.
@@ -2853,7 +2849,7 @@ export class Watcher extends DurableObject<Env> {
     }
     if (replies.length > 0) {
       const cheats = replies.filter((r) => r.kind === 'cheat').length;
-      console.info(`Chat moderation: pointed ${replies.length} player(s) to the Discord (${cheats} about cheating, ${replies.length - cheats} asking for an admin)`);
+      log.info('Chat moderation: pointed players to the Discord', { count: replies.length, cheats });
     }
   }
 
@@ -2861,31 +2857,30 @@ export class Watcher extends DurableObject<Env> {
   // history gets the line, and the moderation log gets the post. An alert is only posted.
   private async actOnChat(config: Config, http: HttpClient, call: ChatCall, now: number): Promise<void> {
     const { line } = call;
-    const player = `${JSON.stringify(line.name)} (${line.steamId ?? 'no Steam ID'})`;
     const evidence = callEvidence(call);
     if (call.kind !== 'alert' && line.steamId !== null) {
       if (call.kind === 'ban') {
         const reason = BAN_REASON;
         const result = await this.ban({ steamId: line.steamId, name: line.name || line.steamId, length: 'permanent', reason, by: 'bot', detail: evidence });
         if (result.outcome === 'already-banned') {
-          console.info(`Chat moderation: ${player} is banned already, so nothing was done. ${evidence}`);
+          log.info('Chat moderation: banned already, so nothing was done', { list: call.hit.list });
           return;
         }
         // The ban keeps them out from now on; a kick removes them if they are in game.
         if (!result.waiting) {
           await kickPlayer(config.rconUrl, config.rconPassword, line.steamId, banKickReason(reason, config.siteUrl), http).catch((error: unknown) => {
-            if (!isNotInGame(error)) console.error(`Chat moderation: banned ${player} but could not kick them: ${errorText(error)}`);
+            if (!isNotInGame(error)) log.error('Chat moderation: banned but could not kick', {}, error);
           });
         }
-        console.info(`Chat moderation: banned ${player}. ${evidence}`);
+        log.info('Chat moderation: banned', { list: call.hit.list });
         return;
       }
       await messagePlayer(config.rconUrl, config.rconPassword, line.steamId, staffWarning(WARNING_TEXT, config.siteUrl), http);
       await this.record(line.steamId, { action: 'warn', at: now, by: 'bot', name: line.name, reason: WARNING_TEXT, detail: evidence });
-      console.info(`Chat moderation: warned ${player}. ${evidence}`);
+      log.info('Chat moderation: warned', { list: call.hit.list });
       return;
     }
-    console.info(`Chat moderation: flagged ${player}, no action (${call.why ?? 'none'}). ${evidence}`);
+    log.info('Chat moderation: flagged, no action', { why: call.why ?? 'none', list: call.hit.list });
     const { modLogWebhookUrl, siteUrl } = this.posting();
     if (modLogWebhookUrl === undefined) return;
     await postWebhook(modLogWebhookUrl, buildChatAlert(call, siteUrl));
@@ -2905,13 +2900,12 @@ export class Watcher extends DurableObject<Env> {
         const ban = book[steamId];
         if (ban === undefined) continue;
         const current = onServer.find((b) => b.steamId === steamId);
-        const label = `${JSON.stringify(ban.name)} (${steamId})`;
         if (current === undefined || !isBotBan(current.reason, ban)) {
           // Lifted already, or lifted and banned again some other way: that ban is not the bot's to lift. A ban still
           // waiting for the player to join was never on the server.
           await this.record(steamId, null, { ban: null });
           const why = current !== undefined ? 'has a newer ban, left alone' : ban.waiting ? 'ran out before they joined' : 'was already unbanned';
-          console.info(`Ban ended: ${label} ${why}`);
+          log.info('Ban ended', { why });
           continue;
         }
         await removeBan(config.rconUrl, config.rconPassword, steamId, http);
@@ -2920,10 +2914,10 @@ export class Watcher extends DurableObject<Env> {
           { action: 'unban', at: now, by: 'bot', name: ban.name, reason: 'The ban ran out' },
           { ban: null, serverBan: null },
         );
-        console.info(`Ban ended: ${label}`);
+        log.info('Ban ended', { why: 'ran out' });
       }
     } catch (error) {
-      console.error(`Lifting ended bans failed: ${errorText(error)}`);
+      log.error('Lifting ended bans failed', {}, error);
     }
   }
 
@@ -2936,7 +2930,6 @@ export class Watcher extends DurableObject<Env> {
       const book = parseBanBook(await this.ctx.storage.get('bans'));
       const work = joinWork(book, snapshot.players.map((p) => p.steamId), Date.now());
       const http = socketHttp(connect);
-      const label = (steamId: string): string => `${JSON.stringify(book[steamId]?.name ?? '')} (${steamId})`;
       // Saves the ban as on the server, with a kick still owed or not. `banned` is set when it has just gone on the server.
       const applied = async (steamId: string, kicking: boolean, banned = false): Promise<void> => {
         const old = book[steamId];
@@ -2954,11 +2947,11 @@ export class Watcher extends DurableObject<Env> {
           await addBan(config.rconUrl, config.rconPassword, steamId, ban.serverReason, http);
         } catch (error) {
           // Left again before the ban went in: it waits for the next time they join.
-          if (!isNotInGame(error)) console.error(`Waiting ban on ${label(steamId)} failed: ${errorText(error)}`);
+          if (!isNotInGame(error)) log.error('Waiting ban failed', {}, error);
           continue;
         }
         await applied(steamId, true, true);
-        console.info(`Ban put on the server as they joined: ${label(steamId)}`);
+        log.info('Ban put on the server as the player joined');
         kick.push(steamId);
       }
       for (const steamId of kick) {
@@ -2969,14 +2962,14 @@ export class Watcher extends DurableObject<Env> {
         } catch (error) {
           // Not in game any more is as good as kicked: the ban keeps them out.
           if (!isNotInGame(error)) {
-            console.error(`Kick after the waiting ban on ${label(steamId)} failed, trying again next check: ${errorText(error)}`);
+            log.error('Kick after the waiting ban failed, trying again next check', {}, error);
             continue;
           }
         }
         await applied(steamId, false);
       }
     } catch (error) {
-      console.error(`Waiting bans failed: ${errorText(error)}`);
+      log.error('Waiting bans failed', {}, error);
     }
   }
 
@@ -2998,7 +2991,7 @@ export class Watcher extends DurableObject<Env> {
       const current: ServerBans = Object.fromEntries(onServer.map(({ steamId, reason, bannedBy }) => [steamId, { reason, bannedBy }]));
       if (saved === null) {
         await storage.put('serverBans', current);
-        console.info(`Watching the server's ban list: ${onServer.length} bans`);
+        log.info("Watching the server's ban list", { bans: onServer.length });
         return;
       }
       const { added, lifted } = banChanges(saved, onServer);
@@ -3016,7 +3009,7 @@ export class Watcher extends DurableObject<Env> {
         if (ours !== undefined && isBotBan(ban.reason, ours)) continue;
         const name = names.get(steamId) ?? steamId;
         await this.record(steamId, { action: 'ban', at: now, by: 'server', name, ...(ban.reason ? { reason: ban.reason } : {}), ...by(ban) });
-        console.info(`Ban made outside the bot: ${JSON.stringify(name)} (${steamId}): ${JSON.stringify(ban.reason ?? '')}`);
+        log.info('Ban made outside the bot');
       }
       for (const { steamId, ban } of lifted) {
         const name = names.get(steamId) ?? steamId;
@@ -3028,11 +3021,11 @@ export class Watcher extends DurableObject<Env> {
           { action: 'unban', at: now, by: 'server', name, ...(ban.reason ? { reason: `Was banned for: ${ban.reason}` } : {}) },
           theirs ? { ban: null } : {},
         );
-        console.info(`Ban lifted outside the bot: ${JSON.stringify(name)} (${steamId})`);
+        log.info('Ban lifted outside the bot');
       }
       await storage.put('serverBans', current);
     } catch (error) {
-      console.error(`Watching the ban list failed: ${errorText(error)}`);
+      log.error('Watching the ban list failed', {}, error);
     }
   }
 
@@ -3079,7 +3072,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       return await this.loadSteam(steamIds);
     } catch (error) {
-      console.error(`Reading Steam checks failed: ${errorText(error)}`);
+      log.error('Reading Steam checks failed', {}, error);
       return new Map();
     }
   }
@@ -3122,7 +3115,7 @@ export class Watcher extends DurableObject<Env> {
           }
         } catch (error) {
           this.steamRetryAt = now + STEAM_RETRY_MS;
-          console.error(`Steam checks failed, trying again in ${STEAM_RETRY_MS / 60_000} minutes: ${errorText(error)}`);
+          log.error('Steam checks failed, trying again later', { minutes: STEAM_RETRY_MS / 60_000 }, error);
         }
       }
       const checked = [...changed];
@@ -3142,12 +3135,9 @@ export class Watcher extends DurableObject<Env> {
       for (const [steamId, check] of checked) {
         const { risk, score } = assess(check, now);
         if (risk === 'low') continue;
-        console.info(
-          `Risky Steam account: ${JSON.stringify(names.get(steamId) ?? '')} (${steamId}): ${RISK_LABELS[risk]}, ${score} points: ` +
-            steamFacts(check, now).join(', '),
-        );
+        log.info('Risky Steam account found', { risk, score });
       }
-      if (checked.length > 0) console.info(`Steam checks: ${checked.length} players`);
+      if (checked.length > 0) log.info('Steam checks done', { players: checked.length });
       if (modLogWebhookUrl === undefined || alerts.length === 0) return;
       const messages = buildSteamAlerts(alerts, now, siteUrl);
       // In order, in the background, so a slow Discord never holds up the check.
@@ -3156,12 +3146,12 @@ export class Watcher extends DurableObject<Env> {
           for (const message of messages) {
             await postWebhook(modLogWebhookUrl, message)
               .then(() => this.countAlert('steam', now, message.embeds.length))
-              .catch((error: unknown) => console.error(`Risky Steam account alert failed: ${errorText(error)}`));
+              .catch((error: unknown) => log.error('Risky Steam account alert failed', {}, error));
           }
         })(),
       );
     } catch (error) {
-      console.error(`Steam checks failed: ${errorText(error)}`);
+      log.error('Steam checks failed', {}, error);
     }
   }
 
@@ -3180,7 +3170,7 @@ export class Watcher extends DurableObject<Env> {
         await this.saveSteam([[steamId, check]]);
         return this.steamChecks.get(steamId) ?? check;
       } catch (error) {
-        console.error(`Steam check for /player failed (${steamId}): ${errorText(error)}`);
+        log.error('Steam check for /player failed', {}, error);
         return saved ?? 'failed';
       }
     });
@@ -3226,7 +3216,7 @@ export class Watcher extends DurableObject<Env> {
         now,
         staff,
         rcon: this.settingsFile({ config, http: socketHttp(connect) }),
-        log: console,
+        log,
       });
       await storage.put('vip', next.state);
       // Posted once, after the list is saved: a failed post is logged, not retried, so nobody is announced twice.
@@ -3243,11 +3233,11 @@ export class Watcher extends DurableObject<Env> {
           });
         const message = buildVipMessage(tag(next.added), tag(next.renewed), rule, config.siteUrl);
         await postWebhook(config.webhookUrl, message).catch((error: unknown) =>
-          console.error(`VIP announcement failed: ${errorText(error)}`),
+          log.error('VIP announcement failed', {}, error),
         );
       }
     } catch (error) {
-      console.error(`VIP update failed: ${errorText(error)}`);
+      log.error('VIP update failed', {}, error);
       // Try again at the next 10-minute mark rather than on every check.
       await storage.put('vip', { ...state, checkedAt: now });
     }
@@ -3339,14 +3329,14 @@ export class Watcher extends DurableObject<Env> {
     // Once the batch is counted, so a batch sent again after a failed write is not added twice.
     if (staffKills.length > 0) this.recordKillDays(day, now, staffKills);
     if (joins !== null && joins.added.length > 0) this.recordSessions(joins.added, now);
-    if (first) console.info(`Kill feed: first kills received. Weapon stats start today (${day}, UTC).`);
+    if (first) log.info('Kill feed: first kills received, weapon stats start today', { day });
     if (grief !== null && grief.alerts.length > 0) this.postGriefAlerts(grief.alerts);
     if (grief !== null && grief.teamKillers.length > 0) this.warnTeamKillers(grief.teamKillers);
     if (kills.length > 0) this.enforceRules(kills, now);
-    if (kills.length > 0) this.ctx.waitUntil(this.coinKills(kills, factionOf, live, now).catch((error: unknown) => console.error(`INITcoins: counting kills failed: ${errorText(error)}`)));
+    if (kills.length > 0) this.ctx.waitUntil(this.coinKills(kills, factionOf, live, now).catch((error: unknown) => log.error('INITcoins: counting kills failed', {}, error)));
     if (streaks !== undefined && streaks.found.length > 0) this.ctx.waitUntil(this.payBounties());
     if (streaks !== undefined && streaks.found.length > 0) {
-      this.ctx.waitUntil(this.coinBreaks(streaks.found, now).catch((error: unknown) => console.error(`INITcoins: paying streak breakers failed: ${errorText(error)}`)));
+      this.ctx.waitUntil(this.coinBreaks(streaks.found, now).catch((error: unknown) => log.error('INITcoins: paying streak breakers failed', {}, error)));
     }
     if (streaks !== undefined && bounty?.announce === true) this.announceBounties(streaks.started, streaks.found, bounty.days, happened.map((e) => e.eventId));
     if (staffKills.length > 0) this.broadcastStaff({ type: 'kills', kills: adminFeed(staffKills) });
@@ -3369,7 +3359,7 @@ export class Watcher extends DurableObject<Env> {
           try {
             await sendBroadcast(config.rconUrl, config.rconPassword, text, http);
           } catch (error) {
-            console.error(`Bounty announcement failed: ${errorText(error)}`);
+            log.error('Bounty announcement failed', {}, error);
           }
         }
       })(),
@@ -3394,10 +3384,10 @@ export class Watcher extends DurableObject<Env> {
         try {
           const reason = `Ended ${win.victim}'s ${win.streak} kill streak`;
           const result = await this.vipAdd({ steamId: win.steamId, name: win.name, days: (until - now) / DAY_MS, reason, by: 'bot', source: 'bounty' });
-          console.info(`Streak breaker: ${JSON.stringify(win.name)} (${win.steamId}) ${result.outcome}. ${reason}.`);
+          log.info('Streak breaker VIP given', { outcome: result.outcome });
           for (const id of events) settled.add(id);
         } catch (error) {
-          console.error(`Streak breaker VIP failed for ${win.steamId}, will try again: ${errorText(error)}`);
+          log.error('Streak breaker VIP failed, will try again', {}, error);
         }
       }
       if (settled.size === 0) return;
@@ -3553,7 +3543,7 @@ export class Watcher extends DurableObject<Env> {
           try {
             await messagePlayer(config.rconUrl, config.rconPassword, steamId, text.slice(0, 200), http);
           } catch (error) {
-            console.error(`INITcoins message to ${steamId} failed: ${errorText(error)}`);
+            log.error('INITcoins message failed', {}, error);
           }
         }
       })(),
@@ -3790,7 +3780,7 @@ export class Watcher extends DurableObject<Env> {
     });
     await this.ctx.storage.put(COINS_MIGRATED_KEY, { at: now, players: players.length });
     this.coinsMigrated = true;
-    console.info(`INITcoins: paid ${players.length} seeders for their seeds in the last ${COIN_MIGRATION_DAYS} days.`);
+    log.info('INITcoins: seeders paid for their recent seeds', { players: players.length, days: COIN_MIGRATION_DAYS });
   }
 
   private async coinsBackfillDone(): Promise<boolean> {
@@ -3871,7 +3861,7 @@ export class Watcher extends DurableObject<Env> {
     });
     await this.ctx.storage.put(COINS_BACKFILLED_KEY, { at: now, players: paid });
     this.coinsBackfilled = true;
-    console.info(`INITcoins: paid ${paid} players for their seeding, playing and matches before INITcoins (and staff's since).`);
+    log.info('INITcoins: players paid for seeding, playing and matches before INITcoins', { players: paid });
   }
 
   // The Steam account a signed-in player linked, and their name.
@@ -3931,7 +3921,7 @@ export class Watcher extends DurableObject<Env> {
       }
       return { ok: true, message: this.whitelistMessage(given.added.until) };
     } catch (error) {
-      console.error(`INITcoins: whitelist for ${steamId} could not be confirmed: ${errorText(error)}`);
+      log.error('INITcoins: whitelist could not be confirmed', {}, error);
       return this.reconcileWhitelist(steamId, name, item.days, priorExpiry);
     }
   }
@@ -3965,7 +3955,7 @@ export class Watcher extends DurableObject<Env> {
         return { ok: true as const, message: this.whitelistMessage(want) };
       });
     } catch (error) {
-      console.error(`INITcoins: could not read the whitelist to check ${steamId}: ${errorText(error)}`);
+      log.error('INITcoins: could not read the whitelist to check it', {}, error);
       return failed;
     }
   }
@@ -4026,7 +4016,7 @@ export class Watcher extends DurableObject<Env> {
         return { ok: true, message: `You bought ${item.name.replace('Title: ', '')}. It shows on your player page.` };
       } catch (error) {
         await this.ctx.storage.put(key, before);
-        console.error(`INITcoins purchase of ${item.id} for ${steamId} failed, and was given back: ${errorText(error)}`);
+        log.error('INITcoins purchase failed, and was given back', { item: item.id }, error);
         return { ok: false, problem: "Couldn't deliver that just now, so you haven't been charged. Try again in a minute." };
       }
     });
@@ -4082,7 +4072,7 @@ export class Watcher extends DurableObject<Env> {
       const account = parseCoins(await this.ctx.storage.get(key)) ?? blankAccount(name, now);
       const next = adjustCoins(rolled(account, now), delta, `${reason} (${byName ?? by})`.slice(0, 120), now);
       await this.ctx.storage.put(key, next);
-      console.info(`INITcoins: ${byName ?? by} ${delta >= 0 ? 'gave' : 'took'} ${Math.abs(delta)} ${delta >= 0 ? 'to' : 'from'} ${JSON.stringify(name)} (${steamId}): ${reason}`);
+      log.info('INITcoins adjusted by staff', { action: delta >= 0 ? 'give' : 'take', count: Math.abs(delta) });
       return next.balance;
     });
   }
@@ -4124,7 +4114,7 @@ export class Watcher extends DurableObject<Env> {
       const cached = this.killDayCache.get(day);
       if (cached !== undefined) this.killDayCache.set(day, withKillDays(cached, written));
     } catch (error) {
-      console.error(`Staff page kill records failed: ${errorText(error)}`);
+      log.error('Staff page kill records failed', {}, error);
     }
   }
 
@@ -4143,7 +4133,7 @@ export class Watcher extends DurableObject<Env> {
       try {
         this.ctx.storage.transactionSync(write);
       } catch (error) {
-        console.error(`Saving kill summaries failed: ${errorText(error)}`);
+        log.error('Saving kill summaries failed', {}, error);
       }
     });
   }
@@ -4171,7 +4161,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       return headshotsOn(this.keptKillDays(this.killSql(), now), dayOf(now), steamIds);
     } catch (error) {
-      console.error(`Staff page: today's headshots could not be read: ${errorText(error)}`);
+      log.error("Staff page: today's headshots could not be read", {}, error);
       return new Map();
     }
   }
@@ -4196,10 +4186,7 @@ export class Watcher extends DurableObject<Env> {
       if (due.length === 0) return;
       await this.ctx.storage.put(HEADSHOTS_ALERTED_KEY, { day, steamIds: [...alerted, ...due.map((a) => a.steamId)] });
       for (const a of due) {
-        console.info(
-          `Unlikely headshots: ${JSON.stringify(a.name)} (${a.steamId}): ${a.headshots} in ${a.kills} kills, ${luckOdds(a.chance)}, ` +
-            `flagged on ${a.flaggedDays} days`,
-        );
+        log.info('Unlikely headshots flagged', { headshots: a.headshots, kills: a.kills, days: a.flaggedDays });
       }
       const steam = await this.savedSteam(due.map((a) => a.steamId));
       this.ctx.waitUntil(
@@ -4207,12 +4194,12 @@ export class Watcher extends DurableObject<Env> {
           for (const alert of due) {
             await postWebhook(modLogWebhookUrl, buildHeadshotAlert(alert, now, siteUrl, steam.get(alert.steamId) ?? null))
               .then(() => this.countAlert('headshot', now))
-              .catch((error: unknown) => console.error(`Headshot alert failed (${alert.steamId}): ${errorText(error)}`));
+              .catch((error: unknown) => log.error('Headshot alert failed', {}, error));
           }
         })(),
       );
     } catch (error) {
-      console.error(`Headshot alerts failed: ${errorText(error)}`);
+      log.error('Headshot alerts failed', {}, error);
     }
   }
 
@@ -4262,15 +4249,12 @@ export class Watcher extends DurableObject<Env> {
         shadow = next;
         await this.countAlert(`autoTier${entry.tier}`, now);
         changed = true;
-        console.info(
-          `Auto flag (shadow, tier ${entry.tier}, ${entry.rule}): ${JSON.stringify(entry.name)} (${steamId}): ${entry.headshots} headshots in ` +
-            `${entry.kills} kills, ${luckOdds(entry.chance)}, flagged on ${entry.flaggedDays} days`,
-        );
+        log.info('Auto flag recorded (shadow)', { tier: entry.tier, rule: entry.rule, headshots: entry.headshots, kills: entry.kills, days: entry.flaggedDays });
       }
       if (!changed) return;
       await this.ctx.storage.put(AUTO_SHADOW_KEY, shadow);
     } catch (error) {
-      console.error(`Auto flags failed: ${errorText(error)}`);
+      log.error('Auto flags failed', {}, error);
     }
   }
 
@@ -4292,20 +4276,18 @@ export class Watcher extends DurableObject<Env> {
       });
       if (watch !== before) await this.ctx.storage.put(FEED_WATCH_KEY, watch);
       if (event === null) return;
-      console.info(
-        event.type === 'quiet'
-          ? `Kill feed quiet: no batch for ${Math.round((event.at - event.quietFrom) / 60_000)} minutes with ${event.players} players on`
-          : `Kill feed back: events arriving again after ${Math.round((event.heardAt - event.quietFrom) / 60_000)} minutes quiet`,
-      );
+      (event.type === 'quiet'
+        ? log.info('Kill feed quiet: no batch while players are on', { minutes: Math.round((event.at - event.quietFrom) / 60_000), players: event.players })
+        : log.info('Kill feed back: events arriving again', { minutes: Math.round((event.heardAt - event.quietFrom) / 60_000) }));
       const { modLogWebhookUrl, feedAlerts, siteUrl } = config;
       if (modLogWebhookUrl === undefined || !feedAlerts) return;
       this.ctx.waitUntil(
         postWebhook(modLogWebhookUrl, buildFeedAlert(event, siteUrl))
           .then(() => this.countAlert(event.type === 'quiet' ? 'feedQuiet' : 'feedBack', event.at))
-          .catch((error: unknown) => console.error(`Kill feed alert failed: ${errorText(error)}`)),
+          .catch((error: unknown) => log.error('Kill feed alert failed', {}, error)),
       );
     } catch (error) {
-      console.error(`Kill feed watch failed: ${errorText(error)}`);
+      log.error('Kill feed watch failed', {}, error);
     }
   }
 
@@ -4413,7 +4395,7 @@ export class Watcher extends DurableObject<Env> {
         }
       }
     } catch (error) {
-      console.error(`Live page update failed: ${errorText(error)}`);
+      log.error('Live page update failed', {}, error);
     }
   }
 
@@ -4668,11 +4650,11 @@ export class Watcher extends DurableObject<Env> {
       this.recentDays(now),
       this.ctx.storage.list({ prefix: 'mod:' }),
       fetchBans(config.rconUrl, config.rconPassword, http).catch((error: unknown) => {
-        console.error(`Staff page: the ban list could not be read: ${errorText(error)}`);
+        log.error('Staff page: the ban list could not be read', {}, error);
         return null;
       }),
       fetchConfig(config.rconUrl, config.rconPassword, http).catch((error: unknown) => {
-        console.error(`Staff page: ServerSettings.ini could not be read: ${errorText(error)}`);
+        log.error('Staff page: ServerSettings.ini could not be read', {}, error);
         return null;
       }),
     ]);
@@ -4681,7 +4663,7 @@ export class Watcher extends DurableObject<Env> {
       try {
         return reservedListing(serverConfig.text);
       } catch (error) {
-        console.error(`Staff page: the whitelist could not be read: ${errorText(error)}`);
+        log.error('Staff page: the whitelist could not be read', {}, error);
         return null;
       }
     })();
@@ -4762,7 +4744,7 @@ export class Watcher extends DurableObject<Env> {
       } catch (error) {
         // A refused token or a rate limit: the rest wait for a later load.
         failed.push(id);
-        console.error(`Staff names: ${errorText(error)}`);
+        log.error('Staff names lookup failed', {}, error);
         break;
       }
     }
@@ -4773,7 +4755,7 @@ export class Watcher extends DurableObject<Env> {
       ...(learned.length === 0 ? {} : { [STAFF_NAMES_KEY]: merged }),
       [LOOKUP_FAILURES_KEY]: withFailures(failures, failed, now),
     });
-    if (learned.length > 0) console.info(`Staff names: looked up ${learned.length} on Discord`);
+    if (learned.length > 0) log.info('Staff names looked up on Discord', { count: learned.length });
     return learned.length === 0 ? null : merged;
   }
 
@@ -4793,7 +4775,7 @@ export class Watcher extends DurableObject<Env> {
         const was = profiles[target];
         if (was === undefined) return { steamId: null };
         await storage.put(STAFF_PROFILES_KEY, unlinkSteam(profiles, target));
-        console.info(`Staff page: ${JSON.stringify(user.name)} unlinked Steam account ${was.steamId} from Discord user ${target}`);
+        log.info('Staff page: Steam account unlinked');
         return { steamId: null };
       }
       const linked = linkSteam(profiles, user, action.steamId, Date.now());
@@ -4804,7 +4786,7 @@ export class Watcher extends DurableObject<Env> {
         return { problem: 'That Steam account is linked to a player, who proved it with their Discord profile or Steam. Check the ID.' };
       }
       await storage.put(STAFF_PROFILES_KEY, linked.profiles);
-      console.info(`Staff page: ${JSON.stringify(user.name)} (Discord user ${user.id}) linked Steam account ${linked.steamId}`);
+      log.info('Staff page: Steam account linked');
       return { steamId: linked.steamId };
     });
     if ('problem' in changed) return changed;
@@ -4855,7 +4837,7 @@ export class Watcher extends DurableObject<Env> {
             direct: (userId, text) => sendDirectMessage(botToken, userId, text),
           }
         : null,
-      log: { info: (message) => console.info(message), error: (message) => console.error(message) },
+      log,
     };
   }
 
@@ -4881,14 +4863,14 @@ export class Watcher extends DurableObject<Env> {
     try {
       await this.accounting(() => this.syncAccountsNow(config, false));
     } catch (error) {
-      console.error(`Player accounts: the pass failed: ${errorText(error)}`);
+      log.error('Player accounts: the pass failed', {}, error);
     }
   }
 
   private syncSoon(config: Config): void {
     this.linkedCache = null;
     this.ctx.waitUntil(
-      this.accounting(() => this.syncAccountsNow(config, true)).catch((error: unknown) => console.error(`Player accounts: the pass failed: ${errorText(error)}`)),
+      this.accounting(() => this.syncAccountsNow(config, true)).catch((error: unknown) => log.error('Player accounts: the pass failed', {}, error)),
     );
   }
 
@@ -4929,15 +4911,15 @@ export class Watcher extends DurableObject<Env> {
           try {
             const result = await sendDirectMessage(botToken, userId, returnText(account.name, players, rule));
             if (result === 'closed') next = { ...next, dmClosed: true };
-            console.info(`Player account: ${result === 'sent' ? 'asked' : 'could not message'} ${userId} back to seed`);
+            log.info('Player account: asked back to seed', { outcome: result });
           } catch (error) {
-            console.error(`Player account: asking ${userId} back failed: ${errorText(error)}`);
+            log.error('Player account: asking a player back failed', {}, error);
           }
           await storage.put(accountKey(userId), next);
         }
       });
     } catch (error) {
-      console.error(`Asking players back failed: ${errorText(error)}`);
+      log.error('Asking players back failed', {}, error);
     }
   }
 
@@ -5078,7 +5060,7 @@ export class Watcher extends DurableObject<Env> {
       [ending !== null && dayOf(ending.endedAt) === today ? unrecordMatchPlayers(todaySoFar, ending.players) : todaySoFar],
     );
     await storage.put({ ...Object.fromEntries(keys.map((key, i) => [key, shards[i] ?? {}])), [LIFETIME_THROUGH_KEY]: today });
-    console.info(`Lifetime totals: added ${listed.size} day${listed.size === 1 ? '' : 's'}`);
+    log.info('Lifetime totals added', { days: listed.size });
   }
 
   // What the records say about the players of a match ending: the milestone each has passed and not been told of, their
@@ -5274,9 +5256,9 @@ export class Watcher extends DurableObject<Env> {
         kv.put(LIFETIME_ROLLED_KEY, yesterday);
       });
       this.lifetimeRolledOn = yesterday;
-      console.info(`Long-term records: ${todo.length} day${todo.length === 1 ? '' : 's'} added, up to ${yesterday}`);
+      log.info('Long-term records added', { days: todo.length, day: yesterday });
     } catch (error) {
-      console.error(`Long-term records failed: ${errorText(error)}`);
+      log.error('Long-term records failed', {}, error);
     }
   }
 
@@ -5463,7 +5445,7 @@ export class Watcher extends DurableObject<Env> {
     try {
       removeArchivedMatch(this.lifetimeSql(), endedAt, record.players.map((p) => p.steamId));
     } catch (error) {
-      console.error(`Long-term records could not drop the removed match: ${errorText(error)}`);
+      log.error('Long-term records could not drop the removed match', {}, error);
     }
     return { match: removed, players: record.players.length };
   }
@@ -5515,7 +5497,7 @@ export class Watcher extends DurableObject<Env> {
     if (modLogWebhookUrl === undefined) return;
     this.ctx.waitUntil(
       postWebhook(modLogWebhookUrl, buildClanMoveMessage(move, siteUrl)).catch((error: unknown) =>
-        console.error(`Moderation log post failed (clan move ${JSON.stringify(move.clan)}): ${errorText(error)}`),
+        log.error('Moderation log post failed (clan move)', {}, error),
       ),
     );
   }
@@ -5805,7 +5787,7 @@ const callbackUrl = (request: Request): string => `${new URL(request.url).origin
 
 // Logged each time, so the reason the staff page cannot load is in the Worker logs, not only on the page.
 const notSetUp = (missing: string[]): Response => {
-  console.error(notSetUpText(missing));
+  log.error('Staff sign-in is not set up on the bot', { missing: missing.join(', ') });
   return new Response(notSetUpText(missing), { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8' } });
 };
 
@@ -5849,17 +5831,17 @@ const staffCallback = async (request: Request, vars: Record<string, string>, wat
   try {
     const result = await finishLogin(config, code, callbackUrl(request));
     if ('problem' in result) {
-      console.info(`Staff sign-in refused: ${result.problem}`);
+      log.info('Staff sign-in refused', { why: result.problem });
       return back(`error=${result.problem}`);
     }
-    console.info(`Staff signed in: ${JSON.stringify(result.user.name)} (Discord user ${result.user.id})`);
+    log.info('Staff signed in');
     const { id, name, username } = result.user;
     await watcher()
       .noteStaff(id, name, username)
-      .catch((error: unknown) => console.error(`Noting a staff name failed: ${errorText(error)}`));
+      .catch((error: unknown) => log.error('Noting a staff name failed', {}, error));
     return back(`session=${await createSession(config.clientSecret, result.user, Date.now())}`);
   } catch (error) {
-    console.error(`Staff sign-in failed: ${errorText(error)}`);
+    log.error('Staff sign-in failed', {}, error);
     return back('error=failed');
   }
 };
@@ -5886,7 +5868,7 @@ const playerCallback = async (
       try {
         return await addMember(botToken, config.guildId, userId, accessToken);
       } catch (error) {
-        console.error(`Player sign-in: adding ${userId} to the server failed: ${errorText(error)}`);
+        log.error('Player sign-in: adding to the server failed', {}, error);
         return 'unavailable';
       }
     };
@@ -5896,11 +5878,11 @@ const playerCallback = async (
       { id: user.id, name: user.name },
       { member: login.member, joined: login.join === 'added', steamId: login.steamId, roles: login.roles },
     );
-    console.info(`Player signed in: Discord user ${user.id} (member ${login.member}, join ${login.join ?? 'not asked'}, steam ${result.steam})`);
+    log.info('Player signed in', { member: login.member, join: login.join ?? 'not asked', steam: result.steam });
     const session = await createPlayerSession(config.clientSecret, user, Date.now());
     return backToSite(returnTo, `session=${session}&member=${login.member ? 1 : 0}&join=${login.join ?? 'no'}&steam=${result.steam}`);
   } catch (error) {
-    console.error(`Player sign-in failed: ${errorText(error)}`);
+    log.error('Player sign-in failed', {}, error);
     return backToSite(returnTo, 'error=failed');
   }
 };
@@ -5964,7 +5946,7 @@ const steamCallback = async (request: Request, vars: Record<string, string>): Pr
     if (steamId === null) return to('error=steam');
     return to(`steamproof=${await createSteamProof(config.clientSecret, steamId, Date.now())}`);
   } catch (error) {
-    console.error(`Steam sign-in failed: ${errorText(error)}`);
+    log.error('Steam sign-in failed', {}, error);
     return to('error=steam');
   }
 };
@@ -5999,14 +5981,14 @@ const accountApi = async (request: Request, vars: Record<string, string>, watche
     'cache-control': 'no-store',
     vary: 'origin',
   };
-  if ('missing' in config) console.error(notSetUpText(config.missing));
+  if ('missing' in config) log.error('Sign-in is not set up on the bot', { missing: config.missing.join(', ') });
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers });
   if ('missing' in config) return Response.json({ error: 'Sign-in is not set up yet.' }, { status: 503, headers });
   const session = await readPlayerSession(config.clientSecret, request.headers.get('authorization'), Date.now());
   if (session === null) return Response.json({ error: 'Sign in again' }, { status: 401, headers });
   const route = `${request.method} ${new URL(request.url).pathname}`;
   const unavailable = (what: string, error: unknown): Response => {
-    console.error(`Player account ${what} failed: ${errorText(error)}`);
+    log.error('Player account request failed', { action: what }, error);
     return Response.json({ error: "Couldn't do that just now. Try again in a minute." }, { status: 503, headers });
   };
   if (route === 'GET /api/account') {
@@ -6074,7 +6056,7 @@ const goDiscord = (request: Request, vars: Record<string, string>, watcher: () =
   ctx.waitUntil(
     watcher()
       .discordClick(sourceOf(new URL(request.url).searchParams.get('src')))
-      .catch((error: unknown) => console.error(`Counting a Discord click failed: ${errorText(error)}`)),
+      .catch((error: unknown) => log.error('Counting a Discord click failed', {}, error)),
   );
   return new Response(null, {
     status: 302,
@@ -6168,7 +6150,7 @@ const commandTools = (
       records,
       coins,
       now: Date.now,
-      log: console,
+      log,
     }),
     suggest: suggestOptions({
       recentMatches: () => watcher().recentMatches(),
@@ -6235,7 +6217,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     vary: 'origin',
   };
   // Logged on the browser's preflight too: without SITE_URL the browser stops there and never sends the request.
-  if ('missing' in config) console.error(notSetUpText(config.missing));
+  if ('missing' in config) log.error('Sign-in is not set up on the bot', { missing: config.missing.join(', ') });
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers });
   if ('missing' in config) return Response.json({ error: notSetUpText(config.missing) }, { status: 503, headers });
   if (request.method === 'GET' && new URL(request.url).pathname === '/api/admin/live') {
@@ -6257,7 +6239,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const focused = body.focused ?? '';
       if (!isOptionOf(name, focused, options['subcommand'])) return Response.json({ choices: [] }, { headers });
       const choices = await tools.suggest({ name, options, userId: session.userId, focused }).catch((error: unknown) => {
-        console.error(`/${name} suggestions for the staff page failed: ${errorText(error)}`);
+        log.error('Staff page: command suggestions failed', { command: name }, error);
         return [];
       });
       return Response.json({ choices }, { headers });
@@ -6265,12 +6247,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     // Checked as Discord checks a slash command, then run by the same code, as the signed-in staff member.
     const checked = checkOptions(name, body.options);
     if ('problem' in checked) return Response.json({ error: checked.problem }, { status: 400, headers });
-    console.info(`Staff page: /${name} by ${JSON.stringify(session.name)} (Discord user ${session.userId})`);
+    log.info('Staff page: command used', { command: name });
     try {
       const reply = await tools.run({ name, options: checked.options, userId: session.userId, userName: session.name });
       return Response.json(reply, { headers });
     } catch (error) {
-      console.error(`/${name} from the staff page failed: ${errorText(error)}`);
+      log.error('Staff page: command failed', { command: name }, error);
       return Response.json({ error: failureText(name, error) }, { status: 502, headers });
     }
   }
@@ -6280,15 +6262,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/rotations') return Response.json(await watcher().rotationsPage(), { headers });
       const action = await readRotationAction(request);
       if (action === null) return Response.json({ error: 'Not a rotations request' }, { status: 400, headers });
-      const what = 'entries' in action ? ` (${action.entries.length} maps)` : 'days' in action ? ` for days ${action.days.join(',')}` : '';
-      console.info(
-        `Staff page: rotations ${action.action} ${JSON.stringify(action.name)}${what} by ${JSON.stringify(session.name)} (Discord user ${session.userId})`,
-      );
+      log.info('Staff page: rotations changed', { action: action.action, rotation: action.name, maps: 'entries' in action ? action.entries.length : null, days: 'days' in action ? action.days.join(',') : null });
       const result = await watcher().rotationsAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page rotations failed: ${errorText(error)}`);
+      log.error('Staff page rotations failed', {}, error);
       return Response.json({ error: "Couldn't reach the rotations right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6308,10 +6287,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (result.status === 'refused') {
         return Response.json({ error: `The server won't take it: ${result.reason}.` }, { status: 422, headers });
       }
-      console.info(`Staff page: welcome message saved by ${JSON.stringify(session.name)} (Discord user ${session.userId}) (${edit.lines.length} lines, ${edit.enabled ? 'on' : 'off'})`);
+      log.info('Staff page: welcome message saved', { lines: edit.lines.length, enabled: edit.enabled });
       return Response.json({ ...result.page, outcome: result.outcome }, { headers });
     } catch (error) {
-      console.error(`Staff page welcome message failed: ${errorText(error)}`);
+      log.error('Staff page welcome message failed', {}, error);
       const readOnly = errorText(error).includes('read-only');
       return Response.json(
         {
@@ -6329,15 +6308,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/lines') return Response.json(await watcher().linesPage(), { headers });
       const action = await readLinesAction(request);
       if (action === null) return Response.json({ error: 'Not a lines request' }, { status: 400, headers });
-      const what = action.action === 'save' ? ` (${action.lines.length} lines)` : '';
-      console.info(
-        `Staff page: lines ${action.action} ${JSON.stringify(action.list)}${what} by ${JSON.stringify(session.name)} (Discord user ${session.userId})`,
-      );
+      log.info('Staff page: lines changed', { action: action.action, list: action.list, lines: action.action === 'save' ? action.lines.length : null });
       const result = await watcher().linesAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page lines failed: ${errorText(error)}`);
+      log.error('Staff page lines failed', {}, error);
       return Response.json({ error: "Couldn't reach the lines right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6347,13 +6323,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/rules') return Response.json(await watcher().rulesPage(), { headers });
       const action = await readRulesAction(request);
       if (action === null) return Response.json({ error: 'Not a weapon rules request' }, { status: 400, headers });
-      const what = action.action === 'save' ? ` ${JSON.stringify(action.name)} (${action.mode}, ${action.weapons.length} weapons)` : ` ${JSON.stringify(action.id)}`;
-      console.info(`Staff page: weapon rule ${action.action}${what} by ${JSON.stringify(session.name)} (Discord user ${session.userId})`);
+      log.info('Staff page: weapon rule changed', { action: action.action, rule: action.action === 'save' ? action.name : action.id });
       const result = await watcher().rulesAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page weapon rules failed: ${errorText(error)}`);
+      log.error('Staff page weapon rules failed', {}, error);
       return Response.json({ error: "Couldn't reach the weapon rules right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6364,7 +6339,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().chatFeed(after), { headers });
     } catch (error) {
-      console.error(`Staff page live chat failed: ${errorText(error)}`);
+      log.error('Staff page live chat failed', {}, error);
       return Response.json({ error: "Couldn't read the chat right now." }, { status: 503, headers });
     }
   }
@@ -6374,14 +6349,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/chatwords') return Response.json(await watcher().chatWordsPage(), { headers });
       const action = await readWordsAction(request);
       if (action === null) return Response.json({ error: 'Not a chat filter request' }, { status: 400, headers });
-      console.info(
-        `Staff page: chat filter ${action.action} ${JSON.stringify(action.word)} on the ${action.list} list by ${JSON.stringify(session.name)} (Discord user ${session.userId})`,
-      );
+      log.info('Staff page: chat filter changed', { action: action.action, list: action.list });
       const result = await watcher().chatWordsAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page chat filter failed: ${errorText(error)}`);
+      log.error('Staff page chat filter failed', {}, error);
       return Response.json({ error: "Couldn't reach the chat filter right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6395,7 +6368,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const chosen = season === 'shown' ? (seasonAt(now) ?? shownSeason(now)) : season;
       return Response.json(await watcher().season(chosen, true), { headers });
     } catch (error) {
-      console.error(`Staff page season roundup failed: ${errorText(error)}`);
+      log.error('Staff page season roundup failed', {}, error);
       return Response.json({ error: "Couldn't build the season roundup right now." }, { status: 503, headers });
     }
   }
@@ -6408,7 +6381,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff profile change failed: ${errorText(error)}`);
+      log.error('Staff profile change failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6418,11 +6391,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     if (action === null) return Response.json({ error: 'Not a check request' }, { status: 400, headers });
     try {
       const result = await watcher().checkPlayer(action, { id: session.userId, name: session.name });
-      const what = action.action === 'check' ? `checked ${action.steamId} (${action.reasons.join(', ') || 'no flags'})` : `took back the check on ${action.steamId}`;
-      console.info(`Staff page: ${JSON.stringify(session.name)} (Discord user ${session.userId}) ${what}`);
+      log.info('Staff page: player check', { action: action.action, count: action.action === 'check' ? action.reasons.length : 0 });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page check failed: ${errorText(error)}`);
+      log.error('Staff page check failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6433,7 +6405,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await commandTools(vars, watcher).record(player), { headers });
     } catch (error) {
-      console.error(`Staff page player record failed: ${errorText(error)}`);
+      log.error('Staff page player record failed', {}, error);
       return Response.json({ error: "Couldn't load their record just now." }, { status: 503, headers });
     }
   }
@@ -6443,11 +6415,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     if (action === null) return Response.json({ error: 'Not a dealt-with request' }, { status: 400, headers });
     try {
       const result = await watcher().dealWith(action, { id: session.userId, name: session.name });
-      const what = action.action === 'deal' ? `dealt with ${action.steamId} (${action.reasons.join(', ') || 'no flags'})` : `undid dealing with ${action.steamId}`;
-      console.info(`Staff page: ${JSON.stringify(session.name)} (Discord user ${session.userId}) ${what}`);
+      log.info('Staff page: player dealt with', { action: action.action, count: action.action === 'deal' ? action.reasons.length : 0 });
       return Response.json(result, { headers });
     } catch (error) {
-      console.error(`Staff page dealt-with failed: ${errorText(error)}`);
+      log.error('Staff page dealt-with failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6456,7 +6427,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().adminLifetime(), { headers });
     } catch (error) {
-      console.error(`Staff page lifetime failed: ${errorText(error)}`);
+      log.error('Staff page lifetime failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6467,7 +6438,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const csv = await watcher().adminLifetimeCsv(table);
       return new Response(csv, { headers: { ...headers, 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="wardogs-${table}.csv"` } });
     } catch (error) {
-      console.error(`Staff page lifetime export failed: ${errorText(error)}`);
+      log.error('Staff page lifetime export failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6481,7 +6452,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const page = player === null ? await watcher().adminKills(days) : await watcher().adminPlayerKills(player, days);
       return Response.json(page, { headers });
     } catch (error) {
-      console.error(`Staff page kills failed: ${errorText(error)}`);
+      log.error('Staff page kills failed', {}, error);
       return Response.json({ error: 'The kill feed is unavailable' }, { status: 503, headers });
     }
   }
@@ -6490,7 +6461,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().adminRetention(days), { headers });
     } catch (error) {
-      console.error(`Staff page play time failed: ${errorText(error)}`);
+      log.error('Staff page play time failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6499,7 +6470,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().discordGrowth(), { headers });
     } catch (error) {
-      console.error(`Staff page Discord growth failed: ${errorText(error)}`);
+      log.error('Staff page Discord growth failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6508,7 +6479,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     const overview = await watcher().adminOverview(days);
     return Response.json({ ...overview, user: { id: session.userId, name: session.name } }, { headers });
   } catch (error) {
-    console.error(`Staff page failed: ${errorText(error)}`);
+    log.error('Staff page failed', {}, error);
     return Response.json({ error: 'The staff page is unavailable' }, { status: 503, headers });
   }
 };
@@ -6529,7 +6500,7 @@ const reviewApi = async (request: Request, vars: Record<string, string>, watcher
   if (token === '') return new Response('Not found', { status: 404 });
   const headers = { 'cache-control': 'no-store' };
   if (token.length < MIN_FEED_TOKEN) {
-    console.error(`Alert review refused: REVIEW_TOKEN must be at least ${MIN_FEED_TOKEN} characters`);
+    log.error('Alert review refused: REVIEW_TOKEN is too short', { minLength: MIN_FEED_TOKEN });
     return Response.json({ error: 'REVIEW_TOKEN is too short' }, { status: 500, headers });
   }
   if (!(await feedAuthorized(request.headers.get('authorization'), token))) {
@@ -6540,7 +6511,7 @@ const reviewApi = async (request: Request, vars: Record<string, string>, watcher
   try {
     return Response.json(await watcher().review(days), { headers });
   } catch (error) {
-    console.error(`Alert review failed: ${errorText(error)}`);
+    log.error('Alert review failed', {}, error);
     return Response.json({ error: 'The review is unavailable' }, { status: 503, headers });
   }
 };
@@ -6562,15 +6533,13 @@ const ingestKills = async (request: Request, vars: Record<string, string>, watch
   const token = vars['KILL_FEED_TOKEN']?.trim() ?? '';
   if (token === '') return new Response('Not found', { status: 404 });
   if (token.length < MIN_FEED_TOKEN) {
-    console.error(`Kill feed refused: KILL_FEED_TOKEN must be at least ${MIN_FEED_TOKEN} characters`);
+    log.error('Kill feed refused: KILL_FEED_TOKEN is too short', { minLength: MIN_FEED_TOKEN });
     return Response.json({ error: 'KILL_FEED_TOKEN is too short' }, { status: 500 });
   }
   if (!(await feedAuthorized(request.headers.get('authorization'), token))) {
     if (Date.now() - refusalLoggedAt >= REFUSAL_LOG_MS) {
       refusalLoggedAt = Date.now();
-      console.error(
-        'Kill feed refused: the token does not match KILL_FEED_TOKEN. Check the Token in the EventFeedEndpoints line in ServerSettings.ini.',
-      );
+      log.error('Kill feed refused: the token does not match KILL_FEED_TOKEN. Check the Token in the EventFeedEndpoints line in ServerSettings.ini.');
     }
     return Response.json({ error: 'Unknown kill feed token' }, { status: 401 });
   }
@@ -6589,7 +6558,7 @@ const ingestKills = async (request: Request, vars: Record<string, string>, watch
   // After a game update, this is how a feed sent in a new form shows: batches come, and nothing in them is read.
   if (timeline.length + presence.length === 0 && unread > 0 && Date.now() - unreadLoggedAt >= REFUSAL_LOG_MS) {
     unreadLoggedAt = Date.now();
-    console.error(`Kill feed: a batch came with ${unread} events, and none could be read. The game may send them in a new form.`);
+    log.error('Kill feed: a batch came and none of its events could be read. The game may send them in a new form.', { unread });
   }
   try {
     const { accepted, ended, over } =
@@ -6600,7 +6569,7 @@ const ingestKills = async (request: Request, vars: Record<string, string>, watch
     if (over) await watcher().voteMatchOver();
     return Response.json({ ok: true, accepted, skipped: unread });
   } catch (error) {
-    console.error(`Kill feed batch failed: ${errorText(error)}`);
+    log.error('Kill feed batch failed', {}, error);
     return Response.json({ error: 'Could not record the kills' }, { status: 503 });
   }
 };
@@ -6634,7 +6603,7 @@ export default {
       try {
         return await serveJson(route.key, route.load, ctx, route.keepMs);
       } catch (error) {
-        console.error(`${url.pathname} failed: ${error instanceof Error ? error.message : String(error)}`);
+        log.error('Stats route failed', { route: url.pathname }, error);
         return Response.json({ error: 'Stats are unavailable' }, { status: 503, headers: { 'access-control-allow-origin': '*' } });
       }
     }
@@ -6656,7 +6625,7 @@ export default {
             isAdminCommand(request.name) && userId && userName
               ? watcher()
                   .noteStaff(userId, userName, userHandle ?? null)
-                  .catch((error: unknown) => console.error(`Noting a staff name failed: ${errorText(error)}`))
+                  .catch((error: unknown) => log.error('Noting a staff name failed', {}, error))
               : Promise.resolve();
           try {
             return await run(request);
@@ -6668,7 +6637,7 @@ export default {
         editReply: editOriginalReply(),
         deleteReply: deleteOriginalReply(),
         privateFollowUp: sendPrivateFollowUp(),
-        log: console,
+        log,
         now: Date.now,
         adminGuildId: vars['DISCORD_GUILD_ID']?.trim() || undefined,
         voteGuildId: vars['DISCORD_GUILD_ID']?.trim() || undefined,
@@ -6681,7 +6650,7 @@ export default {
       },
     );
     if (result.followUp) {
-      ctx.waitUntil(result.followUp().catch((error: unknown) => console.error(`Command reply failed: ${String(error)}`)));
+      ctx.waitUntil(result.followUp().catch((error: unknown) => log.error('Command reply failed', {}, error)));
     }
     return Response.json(result.body, { status: result.status });
   },

@@ -1,3 +1,4 @@
+import { log } from './log.ts';
 import { z } from 'zod';
 import type { JoinOutcome } from './adminauth.ts';
 
@@ -47,7 +48,7 @@ export const isMember = async (botToken: string, guildId: string, userId: string
   const response = await botCall(botToken, fetchFn)(`/guilds/${guildId}/members/${userId}`, 'GET');
   if (response.ok) return true;
   if (response.status === 404) return false;
-  console.error(`Player account: could not check if ${userId} is in server ${guildId}: ${response.status} ${await response.text()}`);
+  log.error('Player account: could not check if a player is in the server', { status: response.status });
   return null;
 };
 

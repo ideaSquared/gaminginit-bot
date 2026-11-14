@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import { z } from 'zod';
 import type { Embed } from './discord.ts';
 
@@ -588,7 +589,7 @@ export const handleTicket = async (
   tools: TicketTools,
   request: TicketRequest,
   edit: (reply: TicketReply) => Promise<void>,
-  log: { error: (message: string) => void },
+  log: Log,
 ): Promise<TicketResult> => {
   const { rule } = tools;
   if (rule === null) return privateMessage('Tickets are not set up yet. Ask staff to set DISCORD_TICKET_CATEGORY_ID.');
@@ -601,7 +602,7 @@ export const handleTicket = async (
     body: { type: DEFERRED_CHANNEL_MESSAGE, data: { flags: EPHEMERAL } },
     followUp: async () => {
       const content = await work().catch((error: unknown) => {
-        log.error(`Ticket ${request.customId} failed: ${error instanceof TicketProblem ? error.detail : errorText(error)}`);
+        log.error('Ticket action failed', {}, error instanceof TicketProblem ? error.detail : error);
         return error instanceof TicketProblem ? error.message : failure;
       });
       await edit({ content });
@@ -651,7 +652,7 @@ export const handleTicket = async (
       body: { type: UPDATE_MESSAGE, data: { content: 'Taking the ticket over…', components: [] } },
       followUp: async () => {
         const content = await takeOverTicket(ready, channelId, argument, request).catch((error: unknown) => {
-          log.error(`Taking over ticket ${channelId} failed: ${errorText(error)}`);
+          log.error('Taking over a ticket failed', {}, error);
           return "Couldn't take the ticket over right now. Try again.";
         });
         await edit({ content }).catch(() => undefined);
@@ -674,7 +675,7 @@ export const handleTicket = async (
       body: { type: UPDATE_MESSAGE, data: { content: 'Closing the ticket…', components: [] } },
       followUp: async () => {
         const content = await closeTicket(ready, channelId, request).catch((error: unknown) => {
-          log.error(`Closing ticket ${channelId} failed: ${errorText(error)}`);
+          log.error('Closing a ticket failed', {}, error);
           return `Couldn't close the ticket (${errorText(error)}).`;
         });
         // The channel may be gone by now; the answer is for the staff member's private message, which outlives it.

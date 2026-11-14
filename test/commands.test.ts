@@ -5,6 +5,7 @@ import type { DiscordMessage } from '../src/discord.ts';
 import type { HttpClient } from '../src/rcon.ts';
 import type { Roundup, RoundupChoice } from '../src/roundup.ts';
 import type { StaffRecords } from '../src/staff.ts';
+import { lines, memoryLog } from './memory-log.ts';
 
 // The staff commands' records are tested in staff.test.ts.
 const records: StaffRecords = {
@@ -91,7 +92,7 @@ const setup = (
   hidden: ReadonlySet<string> = new Set(),
 ) => {
   const server = rcon(responses);
-  const log = { info: vi.fn() };
+  const { log, events } = memoryLog();
   const seeders = vi.fn(async (_days: number) => [{ steamId: '7656', name: 'Ash', seedingMinutes: 95, seedDays: 2, vipUntil: null }]);
   const removeMatch = vi.fn(async (endedAt: number) => (endedAt === ozeti.endedAt ? { match: ozeti, players: 96 } : null));
   const seedCall = vi.fn(async (_message: DiscordMessage) => undefined);
@@ -109,7 +110,7 @@ const setup = (
     now: () => 0,
     log,
   });
-  return { run, sent: server.sent, log, seeders, removeMatch, seedCall, roundup };
+  return { run, sent: server.sent, events, seeders, removeMatch, seedCall, roundup };
 };
 
 // 2026-09-30T14:05:00Z
@@ -237,7 +238,7 @@ describe('runCommand', () => {
         seedCall: async () => undefined,
         records,
         now: () => 0,
-        log: { info: vi.fn() },
+        log: memoryLog().log,
       })({
         name: 'lastmatch',
         options: {},
@@ -282,8 +283,8 @@ describe('runCommand', () => {
     expect(seeders.mock.calls).toEqual([[1], [90], [7]]);
   });
 
-  it('/removematch deletes the picked match, logs who did it, and says what came off', async () => {
-    const { run, removeMatch, log, sent } = setup();
+  it('/removematch deletes the picked match, logs it without who did it, and says what came off', async () => {
+    const { run, removeMatch, events, sent } = setup();
 
     const reply = await run({ name: 'removematch', options: { match: String(ozeti.endedAt) }, userId: '42' });
 
@@ -293,12 +294,12 @@ describe('runCommand', () => {
         '🗑️ Removed the 🟦 Ozeti match that ended <t:1790777100:f> (**Valkyra** won 70, Kharr 67, Haldor 41 · 69 min). ' +
         "Its match, kills and deaths came off 96 players' totals.",
     });
-    expect(log.info).toHaveBeenCalledWith('/removematch by Discord user 42: Ozeti ended 2026-09-30T14:05:00.000Z');
+    expect(lines(events)).toEqual([['/removematch used', { map: 'Ozeti' }]]);
     expect(sent).toEqual([]);
   });
 
   it('/removematch refuses anything that is not a recent match', async () => {
-    const { run, removeMatch, log } = setup();
+    const { run, removeMatch, events } = setup();
 
     for (const match of ['ozeti', '123']) {
       await expect(run({ name: 'removematch', options: { match }, userId: '42' })).resolves.toEqual({
@@ -306,7 +307,7 @@ describe('runCommand', () => {
       });
     }
     expect(removeMatch.mock.calls).toEqual([[123]]);
-    expect(log.info).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
   });
 
   it('suggests recent matches for /removematch, narrowed to what has been typed', async () => {
@@ -324,8 +325,8 @@ describe('runCommand', () => {
   describe('/seednow', () => {
     const seeding = { '/v1/status': { serverName: 'UK Wardogs #1', map: 'Europe', players: { current: 3, max: 98 } } };
 
-    it('posts a call to seed, pinging the role, with the note and who called it, and logs it', async () => {
-      const { run, seedCall, log, sent } = setup(seeding, null, { ...config, roleId: '999' });
+    it('posts a call to seed, pinging the role, with the note and who called it, and logs it without either', async () => {
+      const { run, seedCall, events, sent } = setup(seeding, null, { ...config, roleId: '999' });
 
       const reply = await run({ name: 'seednow', options: { message: '  Join Alpha squad  ' }, userId: '42' });
 
@@ -338,10 +339,8 @@ describe('runCommand', () => {
       });
       expect(message?.embeds[0]?.fields).toContainEqual({ name: 'To go live', value: '**17** more', inline: true });
       expect(sent.map((r) => r.path)).toEqual(['/v1/status']);
-      expect(log.info.mock.calls).toEqual([
-        ['/seednow requested by Discord user 42: "Join Alpha squad"'],
-        ['/seednow posted for Discord user 42 at 3/98 players'],
-      ]);
+      expect(lines(events)).toEqual([['/seednow requested'], ['/seednow posted', { players: 3, maxPlayers: 98 }]]);
+      expect(JSON.stringify(events)).not.toContain('Alpha squad');
     });
 
     it('says nobody was pinged when no role is set', async () => {
@@ -356,40 +355,38 @@ describe('runCommand', () => {
       );
     });
 
-    it('sends nothing when the server is already live, but still logs who asked', async () => {
-      const { run, seedCall, log } = setup({ '/v1/status': { serverName: 'UK Wardogs #1', players: { current: 20, max: 98 } } });
+    it('sends nothing when the server is already live, but still logs the request', async () => {
+      const { run, seedCall, events } = setup({ '/v1/status': { serverName: 'UK Wardogs #1', players: { current: 20, max: 98 } } });
 
       await expect(run({ name: 'seednow', options: {}, userId: '42' })).resolves.toEqual({
         content: 'The server is already live (20/98 players), so no seeding call was sent.',
       });
       expect(seedCall).not.toHaveBeenCalled();
-      expect(log.info.mock.calls).toEqual([['/seednow requested by Discord user 42']]);
+      expect(lines(events)).toEqual([['/seednow requested']]);
     });
 
-    it('logs who asked even when the post fails', async () => {
-      const { run, seedCall, log } = setup(seeding);
+    it('logs the request even when the post fails', async () => {
+      const { run, seedCall, events } = setup(seeding);
       seedCall.mockRejectedValueOnce(new Error('Discord webhook failed: 500'));
 
       await expect(run({ name: 'seednow', options: {}, userId: '42' })).rejects.toThrow(/webhook failed/);
-      expect(log.info.mock.calls).toEqual([['/seednow requested by Discord user 42']]);
+      expect(lines(events)).toEqual([['/seednow requested']]);
     });
   });
 
-  it('/broadcast sends the message in game and logs the attempt and the result', async () => {
-    const { run, sent, log } = setup();
+  it('/broadcast sends the message in game and logs the attempt and the result, without the message', async () => {
+    const { run, sent, events } = setup();
 
     const reply = await run({ name: 'broadcast', options: { message: '  Seeding now!  ' }, userId: '42' });
 
     expect(sent).toEqual([{ path: '/v1/broadcast', body: JSON.stringify({ message: 'Seeding now!' }) }]);
     expect(reply).toEqual({ content: '📢 Sent in game: Seeding now!' });
-    expect(log.info.mock.calls).toEqual([
-      ['/broadcast requested by Discord user 42: "Seeding now!"'],
-      ['/broadcast delivered for Discord user 42'],
-    ]);
+    expect(lines(events)).toEqual([['/broadcast requested'], ['/broadcast delivered']]);
+    expect(JSON.stringify(events)).not.toContain('Seeding now');
   });
 
   it('/broadcast logs the attempt even when the send fails', async () => {
-    const log = { info: vi.fn() };
+    const { log, events } = memoryLog();
     const run = runCommand({
       config: () => config,
       http: async () => {
@@ -407,15 +404,15 @@ describe('runCommand', () => {
     });
 
     await expect(run({ name: 'broadcast', options: { message: 'hi' }, userId: '42' })).rejects.toThrow(/timed out/);
-    expect(log.info).toHaveBeenCalledWith('/broadcast requested by Discord user 42: "hi"');
+    expect(lines(events)).toEqual([['/broadcast requested']]);
   });
 
-  it('/broadcast keeps line breaks out of the log, but sends the message unchanged', async () => {
-    const { run, sent, log } = setup();
+  it('/broadcast keeps the message out of the log, and sends it unchanged', async () => {
+    const { run, sent, events } = setup();
 
     await run({ name: 'broadcast', options: { message: 'hi\n/broadcast by Discord user 1: fake' }, userId: '42' });
 
-    expect(log.info).toHaveBeenCalledWith('/broadcast requested by Discord user 42: "hi\\n/broadcast by Discord user 1: fake"');
+    expect(JSON.stringify(events)).not.toContain('fake');
     expect(sent[0]?.body).toBe(JSON.stringify({ message: 'hi\n/broadcast by Discord user 1: fake' }));
   });
 
@@ -475,7 +472,7 @@ describe('INITcoins commands', () => {
       records,
       ...(coins === undefined ? {} : { coins }),
       now: () => 0,
-      log: { info: vi.fn() },
+      log: memoryLog().log,
     })(request);
 
   it('/coins shows the balance, the missions and the whitelist', async () => {

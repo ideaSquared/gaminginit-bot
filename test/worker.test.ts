@@ -434,8 +434,10 @@ describe('the Worker in workerd', { timeout: 30_000 }, () => {
       expect(posts.filter((r) => r === `POST /v1/players/${BO}/message`)).toHaveLength(1);
       expect(posts.filter((r) => r === 'POST /v1/bans')).toHaveLength(1);
       const logs = server.getLogs().map((log) => log.message);
-      expect(logs.some((m) => m.includes(`Chat moderation: banned "Ash" (${ASH})`))).toBe(true);
-      expect(logs.some((m) => m.includes(`Chat moderation: warned "Bo" (${BO})`))).toBe(true);
+      expect(logs.some((m) => m.includes('"message":"Chat moderation: banned"'))).toBe(true);
+      expect(logs.some((m) => m.includes('"message":"Chat moderation: warned"'))).toBe(true);
+      // No player, Steam ID or chat line reaches the logs.
+      for (const m of logs) for (const secret of [ASH, BO, '"Ash"', '"Bo"']) expect(m).not.toContain(secret);
       expect(errors()).toEqual([]);
 
       // The next check asks after the newest line, and acts on nothing again.

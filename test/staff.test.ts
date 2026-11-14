@@ -7,6 +7,7 @@ import type { PrivateProfiles } from '../src/privacy.ts';
 import type { ChatLine, HttpClient } from '../src/rcon.ts';
 import { editRotations, parseRotationBook, rotationDay, type RotationBook, type RotationEdit, type RotationEditResult } from '../src/rotations.ts';
 import type { SteamLookup } from '../src/steam.ts';
+import { lines, memoryLog } from './memory-log.ts';
 import {
   findPlayer,
   inClan,
@@ -132,12 +133,12 @@ const fakeRecords = (): StaffRecords & { [K in keyof StaffRecords]: ReturnType<t
 const setup = (overrides: Record<string, [number, unknown]> = {}) => {
   const server = rcon(overrides);
   const records = fakeRecords();
-  const log = { info: vi.fn() };
+  const { log, events } = memoryLog();
   const run = (name: StaffCommand, options: Record<string, string>) =>
     runStaffCommand({ config: () => config, http: server.http, records, now: () => NOW, log })(name, { name, options, userId: '42' });
   const suggest = (request: Omit<CommandRequest, 'userId'>) =>
     suggestStaff({ config: () => config, http: server.http, records })({ ...request, userId: '42' });
-  return { run, suggest, sent: server.sent, records, log };
+  return { run, suggest, sent: server.sent, records, events };
 };
 
 describe('findPlayer', () => {
@@ -199,7 +200,7 @@ describe('runStaffCommand', () => {
     expect(((await run('chat', { player: 'bo', lines: '1' })) as { content: string }).content).toContain('**Bo**: gg');
     expect(await run('chat', { player: 'zed' })).toEqual({ content: 'No recent chat from "zed". The bot keeps the last 200 lines.' });
 
-    const off = runStaffCommand({ config: () => ({ ...config, chatMod: false }), http: rcon().http, records, now: () => NOW, log: { info: vi.fn() } });
+    const off = runStaffCommand({ config: () => ({ ...config, chatMod: false }), http: rcon().http, records, now: () => NOW, log: memoryLog().log });
     expect(await off('chat', { name: 'chat', options: {}, userId: '42' })).toEqual({ content: 'The bot is not reading the chat: CHAT_MOD is off.' });
   });
 
@@ -217,7 +218,7 @@ describe('runStaffCommand', () => {
       http: server.http,
       records,
       now: () => NOW,
-      log: { info: vi.fn() },
+      log: memoryLog().log,
     });
 
     await run('warn', { name: 'warn', options: { player: BO, message: 'Language' }, userId: '42' });
@@ -435,7 +436,7 @@ describe('runStaffCommand', () => {
   it("keeps the staff member's name in the server with what they did, for the moderation log", async () => {
     const server = rcon();
     const records = fakeRecords();
-    const run = runStaffCommand({ config: () => config, http: server.http, records, now: () => NOW, log: { info: vi.fn() } });
+    const run = runStaffCommand({ config: () => config, http: server.http, records, now: () => NOW, log: memoryLog().log });
     const as = (name: StaffCommand, options: Record<string, string>) => run(name, { name, options, userId: '42', userName: 'Paragon' });
 
     await as('kick', { player: ASH, reason: 'Teamkilling' });
@@ -498,11 +499,13 @@ describe('runStaffCommand', () => {
   });
 
   it('/setnextmap still works when the next map cannot be noted for the live status', async () => {
-    const { run, records, log } = setup();
+    const { run, records, events } = setup();
     records.nextMap.mockRejectedValueOnce(new Error('storage down'));
 
     await expect(run('setnextmap', { map: 'Europe' })).resolves.toMatchObject({ content: expect.stringContaining('Next map') });
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('storage down'));
+    expect(events).toContainEqual(
+      expect.objectContaining({ level: 'warn', message: 'Next map not noted for the live status', error: expect.objectContaining({ message: 'storage down' }) }),
+    );
   });
 
   it('/setnextmap plays the map as the rotation does, changing only what staff asked', async () => {
@@ -732,8 +735,8 @@ describe('runStaffCommand', () => {
 });
 
 describe('/private', () => {
-  it('makes a profile private and public again, through the records, and logs who did it', async () => {
-    const { run, records, log } = setup();
+  it('makes a profile private and public again, through the records, and logs it without who or which player', async () => {
+    const { run, records, events } = setup();
 
     await expect(run('private', { subcommand: 'add', steam_id: ASH })).resolves.toEqual({
       content:
@@ -745,10 +748,11 @@ describe('/private', () => {
     });
     expect(records.makePrivate).toHaveBeenCalledWith({ steamId: ASH, name: 'Ash' }, '42', undefined);
     expect(records.makePublic).toHaveBeenCalledWith(OLD);
-    expect(log.info.mock.calls).toEqual([
-      [`/private add by Discord user 42: "Ash" (${ASH})`],
-      [`/private remove by Discord user 42: "Oldtimer" (${OLD})`],
+    expect(lines(events)).toEqual([
+      ['Staff command used', { command: 'private', action: 'add' }],
+      ['Staff command used', { command: 'private', action: 'remove' }],
     ]);
+    expect(JSON.stringify(events)).not.toContain(ASH);
   });
 
   it('says when there is nothing to change', async () => {
@@ -795,12 +799,12 @@ describe('/private', () => {
 });
 
 describe('/voteoptions', () => {
-  it('turns rain off or on through the records, says when it already was, and logs who did it', async () => {
-    const { run, records, log } = setup();
+  it('turns rain off or on through the records, says when it already was, and logs it', async () => {
+    const { run, records, events } = setup();
 
     await expect(run('voteoptions', { subcommand: 'rain', enabled: 'false' })).resolves.toEqual({ content: expect.stringContaining('Rain is off in map votes') });
     expect(records.setVoteRain).toHaveBeenCalledWith(false, '42', undefined);
-    expect(log.info.mock.calls[0]).toEqual(['/voteoptions rain off by Discord user 42']);
+    expect(lines(events)[0]).toEqual(['Staff command used', { command: 'voteoptions', what: 'rain', action: 'off' }]);
     await expect(run('voteoptions', { subcommand: 'rain', enabled: 'true' })).resolves.toEqual({ content: expect.stringContaining('Rain is on in map votes again') });
     records.setVoteRain.mockResolvedValue(false);
     await expect(run('voteoptions', { subcommand: 'rain', enabled: 'true' })).resolves.toEqual({ content: 'Rain is already on in map votes.' });
@@ -861,8 +865,8 @@ describe('/circles', () => {
     ],
   } as Record<string, [number, unknown]>;
 
-  it('blocks a circle of a map, by id or by name, through the records, and logs who did it', async () => {
-    const { run, records, log } = setup(zones);
+  it('blocks a circle of a map, by id or by name, through the records, and logs it', async () => {
+    const { run, records, events } = setup(zones);
 
     await expect(run('circles', { subcommand: 'block', map: 'Europe', circle: 'ZoneAlternator.Ozeti.Default.Line' })).resolves.toEqual({
       content:
@@ -871,7 +875,7 @@ describe('/circles', () => {
     await run('circles', { subcommand: 'block', map: 'Europe', circle: 'circle' });
     expect(records.blockCircle).toHaveBeenCalledWith({ id: 'ZoneAlternator.Ozeti.Default.Line', map: 'Europe', name: 'Line' }, '42', undefined);
     expect(records.blockCircle).toHaveBeenCalledWith({ id: 'ZoneAlternator.Ozeti.Default.Circle', map: 'Europe', name: 'Circle' }, '42', undefined);
-    expect(log.info.mock.calls[0]).toEqual(['/circles block by Discord user 42: "ZoneAlternator.Ozeti.Default.Line"']);
+    expect(lines(events)[0]).toEqual(['Staff command used', { command: 'circles', action: 'block' }]);
   });
 
   it('warns when every circle of the map is blocked, and refuses one the map does not have, or None', async () => {
@@ -1309,13 +1313,13 @@ describe('/rotations', () => {
 
 describe('/coinadmin', () => {
   it('gives coins with a reason, and says the new balance', async () => {
-    const { run, records, log } = setup();
+    const { run, records, events } = setup();
 
     const reply = await run('coinadmin', { subcommand: 'give', steam_id: BO, amount: '50', reason: 'Event winner' });
 
     expect(records.coinsAdjust).toHaveBeenCalledWith({ steamId: BO, name: 'Bo', delta: 50, reason: 'Event winner', by: '42' });
     expect(reply.content).toMatch(/Gave 50 INITcoins to \*\*Bo\*\*\. They now have 650/);
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('/coinadmin give by Discord user 42'));
+    expect(lines(events)).toEqual([['Staff command used', { command: 'coinadmin', action: 'give', count: 50 }]]);
   });
 
   it('takes coins', async () => {

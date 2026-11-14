@@ -538,7 +538,7 @@ works when it matches exactly one player.
 
 The staff history covers what staff do through the bot, from the deploy with these commands on, and bans made or lifted
 outside the bot, from the deploy with the [moderation log](#moderation-log) on. Each action is
-also logged in the Worker logs with the staff member's Discord user ID. If a reply says an action could not be
+also logged in the Worker logs, without who did it (the [moderation log](#moderation-log) has that). If a reply says an action could not be
 confirmed, check in game before trying again: it may have gone through.
 
 `/chat` shows the latest chat the bot read, from everyone or one player: see [Chat moderation](#chat-moderation).
@@ -610,8 +610,8 @@ are: on the staff page, in the staff commands (`/player` says their profile is p
   The live page shows it at its next update.
 - Not changed: what players see in game, such as the scoreboard, and Discord posts sent
   before. Matches recorded before Steam IDs were kept have names only, so they still show the name they had.
-- Kept by Steam ID in the Durable Object (`privateProfiles`). Each change is logged in the Worker logs with the staff
-  member's Discord user ID (`/private add by Discord user …`).
+- Kept by Steam ID in the Durable Object (`privateProfiles`). Each change is logged in the Worker logs without the
+  player or who did it (`Staff command used`, `command: private`).
 - New commands need `pnpm run register` once (see [Slash commands](#slash-commands)). The staff page lists them as
   soon as the bot is deployed.
 
@@ -1063,7 +1063,7 @@ To set it up, with the [slash commands](#slash-commands) app:
 2. In the `vars` block of `wrangler.jsonc`, set `DISCORD_APPLICATION_ID` to the app's **Application ID** (General
    Information; the same one as in `.env`). It is not secret. Don't set it in the Cloudflare dashboard instead: every
    deploy replaces the dashboard's variables with `wrangler.jsonc`'s. `DISCORD_GUILD_ID` and `SITE_URL` must be set too.
-   If one is missing, the Worker logs say which (`Staff sign-in is not set up on the bot. Missing: …`), and so does the
+   If one is missing, the Worker logs say which (`Staff sign-in is not set up on the bot`, with the missing settings in `missing`), and so does the
    staff page, as long as `SITE_URL` itself is set: without it no site may read the bot's answer.
 3. Optionally, so the page names every staff member (see below), store the bot token from `.env` as a secret:
    ```bash
@@ -1105,8 +1105,8 @@ Admin tools: the page runs the staff commands through the bot, as the signed-in 
   (three RCON requests).
 - A command is checked the way Discord checks one (its options only, required ones given, lengths, ranges and choices),
   then run by the same code as the slash command, so it does exactly the same: the same replies, the staff history,
-  the [moderation log](#moderation-log) and the Worker logs, with the staff member's Discord user ID and name. Each is
-  also logged as `Staff page: /<command> by "<name>" (Discord user <ID>)`.
+  the [moderation log](#moderation-log) and the Worker logs. Each is
+  also logged as `Staff page: command used`, without the staff member's name or Discord user ID.
 - The page asks before anything that changes the game or the records, such as a kick, a ban or a map change.
 
 ### Play time
@@ -1459,8 +1459,8 @@ The Humvee and Kodiak rules are for their guns only: running someone over with o
   not the warning. The warning's offence still counts.
 - **On the record.** Every warning and kick goes in the player's history (`/player`) and the
   [moderation log](#moderation-log) as done by the bot, with the rule, the weapon and which warning it was, and in the
-  Worker logs (`Weapon rule: warned "<name>" (<Steam ID>). …`). One that fails, such as a kick for a player who has
-  just left, is logged (`Weapon rule kick for … failed: …`) and not tried again; the offence still counts.
+  Worker logs (`Weapon rule enforced`, without the player). One that fails, such as a kick for a player who has
+  just left, is logged (`Weapon rule action failed`) and not tried again; the offence still counts.
 - **Any weapon the bot has a name for** can be in a rule; each weapon in one rule only. Up to 20 rules of up to 20
   weapons. A weapon the bot has no name for yet (see [Weapons to name](#kills-and-headshots)) can't be picked until it
   is added to `NAMES` in `src/weapons.ts`.

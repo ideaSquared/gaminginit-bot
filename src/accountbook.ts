@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import {
   ACCOUNT_PREFIX,
   ACCOUNT_WORK_KEY,
@@ -49,10 +50,8 @@ export type BookDeps = {
   now: number;
   rule: AccountRule;
   discord: Discord | null;
-  log: { info: (message: string) => void; error: (message: string) => void };
+  log: Log;
 };
-
-const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 // Discord calls one pass may make. A Worker may only make so many requests, and the rest waits for the next pass.
 export const CALL_BUDGET = 40;
@@ -93,7 +92,7 @@ const claim = async (
       await save(storage, owner.userId, unlinkSteam(old), steamId);
       await setWork(storage, { add: [owner.userId] });
     }
-    deps.log.info(`Player account: Steam account ${steamId} moved from Discord user ${owner.userId} to ${userId}`);
+    deps.log.info('Player account: Steam account moved to another Discord user');
   }
   return linked.steamId === account.steamId ? linked : adopt(linked, vip.granted[steamId], now);
 };
@@ -150,7 +149,7 @@ export const recordSignIn = async (
     } else {
       account = linked;
       steam = 'linked';
-      deps.log.info(`Player account: ${JSON.stringify(user.name)} (Discord user ${user.id}) linked Steam account ${login.steamId} from Discord`);
+      deps.log.info('Player account: Steam account linked from Discord');
     }
   }
   await save(storage, user.id, account, before?.steamId ?? null);
@@ -173,7 +172,7 @@ export const linkWithProof = async (
   if ('problem' in account) return account;
   await save(storage, userId, account, before.steamId);
   await setWork(storage, { add: [userId] });
-  deps.log.info(`Player account: Discord user ${userId} linked Steam account ${steamId} with Steam`);
+  deps.log.info('Player account: Steam account linked with Steam');
   return { steamId };
 };
 
@@ -187,7 +186,7 @@ export const unlink = async (deps: BookDeps, userId: string): Promise<ActionResu
   await save(storage, userId, unlinkSteam(before), before.steamId);
   // The roles come off at the next pass.
   await setWork(storage, { add: [userId] });
-  deps.log.info(`Player account: Discord user ${userId} unlinked Steam account ${before.steamId}`);
+  deps.log.info('Player account: Steam account unlinked');
   return { ok: true };
 };
 
@@ -238,14 +237,14 @@ export const forget = async (deps: BookDeps, userId: string): Promise<ActionResu
       try {
         await discord.setRole(userId, roleId, false);
       } catch (error) {
-        deps.log.error(`Player account: taking ${role} role from ${userId} failed, so the account is kept: ${errorText(error)}`);
+        deps.log.error('Player account: taking a role failed, so the account is kept', { what: role }, error);
         return { problem: "Couldn't take your Discord roles just now, so nothing was deleted. Try again in a minute." };
       }
     }
   }
   await storage.delete([accountKey(userId), ...(before.steamId === null ? [] : [steamLinkKey(before.steamId)])]);
   await setWork(storage, { remove: [userId] });
-  deps.log.info(`Player account: Discord user ${userId} deleted their account`);
+  deps.log.info('Player account: account deleted');
   return { ok: true };
 };
 
@@ -273,7 +272,7 @@ export const view = async (deps: ViewDeps, userId: string, vip: VipState): Promi
         await save(storage, userId, account, account.steamId);
       }
     } catch (error) {
-      deps.log.error(`Player account: could not check if ${userId} is a member: ${errorText(error)}`);
+      deps.log.error('Player account: could not check if a player is a member', {}, error);
     }
   }
   const grant = account.steamId === null ? undefined : vip.granted[account.steamId];
@@ -401,7 +400,7 @@ export const syncAccounts = async (deps: BookDeps, vip: VipState, force: boolean
         }
       } catch (error) {
         failed = true;
-        deps.log.error(`Player account: ${on ? 'giving' : 'taking'} the ${role} role for ${userId} failed: ${errorText(error)}`);
+        deps.log.error('Player account: changing a role failed', { action: on ? 'give' : 'take', what: role }, error);
       }
     }
     account = applied(account, added, removed);
@@ -413,12 +412,12 @@ export const syncAccounts = async (deps: BookDeps, vip: VipState, force: boolean
         const result = await discord.direct(userId, dmText(kind, account.notified?.expiresAt ?? null, rule));
         if (result === 'closed') {
           account = { ...account, dmClosed: true };
-          deps.log.info(`Player account: ${userId} takes no private messages, so their VIP messages stop until they sign in again`);
+          deps.log.info('Player account: a player takes no private messages, so their VIP messages stop until they sign in again');
           break;
         }
-        deps.log.info(`Player account: sent ${userId} the ${kind} VIP message`);
+        deps.log.info('Player account: VIP message sent', { kind });
       } catch (error) {
-        deps.log.error(`Player account: the ${kind} VIP message to ${userId} failed: ${errorText(error)}`);
+        deps.log.error('Player account: VIP message failed', { kind }, error);
       }
     }
     await save(storage, userId, account, found.steamId);

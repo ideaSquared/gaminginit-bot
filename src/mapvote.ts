@@ -739,24 +739,22 @@ export const voteMessage = (vote: MapVote, now: number, siteUrl?: string): VoteM
   return { embeds: [embed], components, allowed_mentions: { parse: [] } };
 };
 
-// The log line for a counted vote: who (the Discord user ID, and their name when it is known), what they voted for, and what
-// it replaced. The logs are the only place who voted for what is kept apart from the vote itself, which the website never gets.
-export const voteLogLine = (
+// The log fields for a counted vote: what was voted on, the choice, whether it replaced an earlier choice, and where the
+// vote came from. Never who voted: the ballots are kept in the vote itself and posted to the moderation log.
+export const voteLogFields = (
   vote: MapVote,
-  press: { userId: string; map?: string; light?: string; weather?: string; userName?: string | undefined; via?: string | undefined },
+  press: { map?: string; light?: string; weather?: string; via?: string | undefined },
   before: Ballot | undefined,
-): string => {
+) => {
   const label = (key: string | null | undefined, rows: readonly { key: string; label: string }[]): string | null =>
     key == null ? null : (rows.find((r) => r.key === key)?.label ?? key);
-  const [what, now, was] =
+  const [what, choice, was] =
     press.map !== undefined
-      ? ['map', vote.options.find((o) => o.map === press.map)?.name ?? press.map, vote.options.find((o) => o.map === before?.map)?.name ?? before?.map]
+      ? ['map', vote.options.find((o) => o.map === press.map)?.name ?? press.map, before?.map]
       : press.weather !== undefined
-        ? ['weather', label(press.weather, vote.weather), label(before?.weather, vote.weather)]
-        : ['time of day', label(press.light, vote.conditions), label(before?.light, vote.conditions)];
-  // JSON.stringify keeps a name with quotes or line breaks on one line.
-  const who = press.userName ? `${JSON.stringify(press.userName.slice(0, 40))} (${press.userId})` : press.userId;
-  return `Map vote ${vote.id}: ${who} voted ${what} ${now}${was ? ` (was ${was})` : ''} via ${press.via ?? 'discord'}`;
+        ? ['weather', label(press.weather, vote.weather), before?.weather]
+        : ['time of day', label(press.light, vote.conditions), before?.light];
+  return { voteId: vote.id, what, choice, replaced: Boolean(was), via: press.via ?? 'discord' };
 };
 
 // One message for the moderation log with every ballot of a vote that closed: for the map, the time of day and the weather, each

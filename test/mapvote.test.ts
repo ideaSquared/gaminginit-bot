@@ -36,7 +36,7 @@ import {
   mapIdOf,
   parseRainRecord,
   rainRecordFor,
-  voteLogLine,
+  voteLogFields,
   voteLogMessage,
   voteProblemMessage,
   parseVoteAlerts,
@@ -165,7 +165,7 @@ describe('pickOptions', () => {
   });
 });
 
-describe('voteLogLine', () => {
+describe('voteLogFields', () => {
   const base = { ...vote(), conditions: conditionOptions(serverLightings), weather: weatherOptions(serverLightings) };
   const cast = (v: MapVote, ballotOf: Parameters<typeof castVote>[1], at: number): MapVote => {
     const result = castVote(v, ballotOf, at);
@@ -173,28 +173,23 @@ describe('voteLogLine', () => {
     return result.vote;
   };
 
-  it('says who voted for which map, by name and Discord ID', () => {
+  it('says which map was voted for, and nothing about who voted', () => {
     const voted = cast(base, { user: '9001', map: 'B' }, NOW + 1);
-    expect(voteLogLine(voted, { userId: '9001', map: 'B', userName: 'Ash' }, undefined)).toBe('Map vote 42: "Ash" (9001) voted map Bravo via discord');
+    const fields = voteLogFields(voted, { map: 'B' }, undefined);
+    expect(fields).toEqual({ voteId: '42', what: 'map', choice: 'Bravo', replaced: false, via: 'discord' });
+    expect(JSON.stringify(fields)).not.toContain('9001');
   });
 
-  it('says what a changed vote replaced', () => {
+  it('says a changed vote replaced an earlier one', () => {
     const first = cast(base, { user: '9001', map: 'B' }, NOW + 1);
     const moved = cast(first, { user: '9001', map: 'C' }, NOW + 2);
-    expect(voteLogLine(moved, { userId: '9001', map: 'C' }, first.ballots[0])).toBe('Map vote 42: 9001 voted map Charlie (was Bravo) via discord');
+    expect(voteLogFields(moved, { map: 'C' }, first.ballots[0])).toMatchObject({ choice: 'Charlie', replaced: true });
   });
 
   it('names the time of day and the weather, and where the vote came from', () => {
     const voted = cast(cast(base, { user: '5', light: 'dusk' }, NOW + 1), { user: '5', weather: 'rain' }, NOW + 2);
-    expect(voteLogLine(voted, { userId: '5', light: 'dusk' }, undefined)).toBe('Map vote 42: 5 voted time of day Dusk via discord');
-    expect(voteLogLine(voted, { userId: '5', weather: 'rain', via: 'website' }, undefined)).toBe('Map vote 42: 5 voted weather Rain via website');
-  });
-
-  it('keeps a name with quotes or line breaks on one line', () => {
-    const voted = cast(base, { user: '1', map: 'A' }, NOW + 1);
-    const line = voteLogLine(voted, { userId: '1', map: 'A', userName: 'Bo "x"\nHacker' }, undefined);
-    expect(line).not.toContain('\n');
-    expect(line).toContain('"Bo \\"x\\"\\nHacker" (1)');
+    expect(voteLogFields(voted, { light: 'dusk' }, undefined)).toMatchObject({ what: 'time of day', choice: 'Dusk', via: 'discord' });
+    expect(voteLogFields(voted, { weather: 'rain', via: 'website' }, undefined)).toMatchObject({ what: 'weather', choice: 'Rain', via: 'website' });
   });
 });
 

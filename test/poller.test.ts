@@ -23,6 +23,7 @@ import type { Player, Snapshot } from '../src/rcon.ts';
 import type { Observation } from '../src/stats.ts';
 import type { FeedPresence } from '../src/weapons.ts';
 import type { MatchState } from '../src/tracking.ts';
+import { errors, lines, memoryLog } from './memory-log.ts';
 
 // The bot's own lines with one seeding line, for tests of when a message goes out rather than what it says.
 const firstSeeding = async (): Promise<Lines> => ({ ...DEFAULT_LINES, seeding: DEFAULT_LINES.seeding.slice(0, 1) });
@@ -93,7 +94,7 @@ const setup = (
   const send = vi.fn(async (message: DiscordMessage) => {
     sent.push(message);
   });
-  const log = { info: vi.fn(), error: vi.fn() };
+  const { log, events } = memoryLog();
   let clock = 0;
   const tick = createPoller({
     config: { ...config, ...overrides },
@@ -114,7 +115,7 @@ const setup = (
   const run = async (times: number) => {
     for (let i = 0; i < times; i++) await tick();
   };
-  return { tick, run, send, sent, log, store };
+  return { tick, run, send, sent, events, store };
 };
 
 const titles = (sent: DiscordMessage[]) => sent.map((m) => m.embeds[0]?.title);
@@ -332,13 +333,13 @@ describe('poller', () => {
   });
 
   it('retries the alert on the next check when Discord rejects it', async () => {
-    const { run, send, log } = setup([snapshot([]), snapshot(crowd(20)), snapshot(crowd(20)), snapshot(crowd(20))]);
+    const { run, send, events } = setup([snapshot([]), snapshot(crowd(20)), snapshot(crowd(20)), snapshot(crowd(20))]);
     send.mockRejectedValueOnce(new Error('Discord webhook failed: 500'));
 
     await run(4);
 
     expect(send).toHaveBeenCalledTimes(2);
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('500'));
+    expect(errors(events)).toContainEqual([expect.any(String), expect.stringContaining('500')]);
   });
 
   it('drops a failed alert that is no longer true by the next check', async () => {
@@ -352,13 +353,13 @@ describe('poller', () => {
   });
 
   it('keeps going when RCON is unreachable', async () => {
-    const { run, tick, sent, log } = setup([snapshot([]), new Error('fetch failed'), snapshot(crowd(1))]);
+    const { run, tick, sent, events } = setup([snapshot([]), new Error('fetch failed'), snapshot(crowd(1))]);
 
     await tick();
     await expect(tick()).resolves.toBeUndefined();
     await run(1);
 
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('fetch failed'));
+    expect(errors(events)).toContainEqual([expect.any(String), expect.stringContaining('fetch failed')]);
     expect(sent).toHaveLength(1);
   });
 
@@ -408,7 +409,7 @@ describe('thanks for seeding', () => {
       fetchSnapshot: async () => queue.shift() ?? snapshot([]),
       send,
       now: () => (clock += 60_000),
-      log: { info: vi.fn(), error: vi.fn() },
+      log: memoryLog().log,
       store: memoryStore(),
       messagePlayer: vi.fn(async (steamId: string, text: string) => {
         sent.push([steamId, text]);
@@ -460,7 +461,7 @@ describe('poller with a grace time for drops', () => {
       },
       send: vi.fn(async () => {}),
       now: () => (clock += 60_000),
-      log: { info: vi.fn(), error: vi.fn() },
+      log: memoryLog().log,
       store: memoryStore(),
       stats: { check: vi.fn(async () => {}), seeded, matchEnded: vi.fn(async () => null) },
     });
@@ -543,7 +544,7 @@ describe('poller with a grace time for drops', () => {
       },
       send,
       now: () => (clock += 60_000),
-      log: { info: vi.fn(), error: vi.fn() },
+      log: memoryLog().log,
       store: memoryStore(),
       stats: { check: vi.fn(async () => {}), seeded, matchEnded: vi.fn(async () => null) },
     });
@@ -722,7 +723,7 @@ describe('poller stats', () => {
 
     it('goes on as without the feed when it cannot be read, and logs it', async () => {
       const stats = sink();
-      const { run, log } = setup(
+      const { run, events } = setup(
         [snapshot(crowd(5)), scored(crowd(22), 60, 40), scored(crowd(22), 99, 70), scored(crowd(22), 0, 0, 'Europe')],
         memoryStore(),
         stats,
@@ -737,13 +738,13 @@ describe('poller stats', () => {
       await run(4);
 
       expect(stats.matchEnded.mock.calls[0]?.[0].factionScores.map((s) => s.score)).toEqual([100, 70]);
-      expect(log.error).toHaveBeenCalledWith("Reading the kill feed's match failed, so the check goes on without it: storage gone");
+      expect(errors(events)).toContainEqual(["Reading the kill feed's match failed, so the check goes on without it", 'storage gone']);
     });
   });
 
   it('records a finished match even when Discord rejects its summary, and keeps tracking the next one', async () => {
     const stats = sink();
-    const { run, send, log } = setup(
+    const { run, send, events } = setup(
       [
         snapshot(crowd(5)),
         snapshot(crowd(22, [player('a', 3)])),
@@ -765,7 +766,7 @@ describe('poller stats', () => {
       ['Europe#0', 180_000, 300_000],
     ]);
     expect(stats.matchEnded.mock.calls[1]?.[0].players['b']).toMatchObject({ name: 'Pb', kills: 6, deaths: 0 });
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('404'));
+    expect(errors(events)).toContainEqual([expect.any(String), expect.stringContaining('404')]);
   });
 
   it('records a match that went live while every Discord post was failing', async () => {
@@ -950,7 +951,7 @@ describe('poller stats', () => {
   it('records a finished match on the next check if recording it failed, then posts the summary once', async () => {
     const stats = sink();
     stats.matchEnded.mockRejectedValueOnce(new Error('storage unavailable'));
-    const { run, send, log } = setup(
+    const { run, send, events } = setup(
       [snapshot(crowd(5)), snapshot(crowd(22, [player('a', 4)])), snapshot(crowd(22), 'Europe'), snapshot(crowd(22), 'Europe')],
       memoryStore(),
       stats,
@@ -958,7 +959,7 @@ describe('poller stats', () => {
 
     await run(4);
 
-    expect(log.error).toHaveBeenCalledWith('Check failed: storage unavailable');
+    expect(errors(events)).toContainEqual(['Check failed', 'storage unavailable']);
     expect(stats.matchEnded.mock.calls.map(([m, at]) => [m.key, m.players['a']?.kills, at])).toEqual([
       ['Kavkazi#0', 4, 180_000],
       ['Kavkazi#0', 4, 240_000],
@@ -1004,13 +1005,13 @@ describe('poller stats', () => {
   it('still sends alerts and saves state when the stats update fails', async () => {
     const stats = sink();
     stats.check.mockRejectedValue(new Error('storage full'));
-    const { run, sent, log, store } = setup([snapshot([]), snapshot(crowd(1))], memoryStore(), stats);
+    const { run, sent, events, store } = setup([snapshot([]), snapshot(crowd(1))], memoryStore(), stats);
 
     await run(2);
 
     expect(titles(sent)).toEqual(['🌱 UK Wardogs #1 is seeding']);
-    expect(log.error).toHaveBeenCalledWith('Stats update failed: storage full');
-    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining('Check failed'));
+    expect(errors(events)).toContainEqual(['Stats update failed', 'storage full']);
+    expect(errors(events).map(([message]) => message)).not.toContain('Check failed');
     await expect(store.load()).resolves.toMatchObject({ alerts: { phase: 'seeding' } });
   });
 });
@@ -1038,7 +1039,7 @@ describe('welcomes', () => {
     const messagePlayer = vi.fn(async (steamId: string, message: string) => {
       sent.push([clock / 60_000, steamId, message]);
     });
-    const log = { info: vi.fn(), error: vi.fn() };
+    const { log, events } = memoryLog();
     const store = memoryStore();
     const tick = createPoller({
       config: { ...config, welcomeMessages: welcome, ...overrides },
@@ -1058,12 +1059,12 @@ describe('welcomes', () => {
     const run = async (times: number) => {
       for (let i = 0; i < times; i++) await tick();
     };
-    return { run, sent, messagePlayer, log, store };
+    return { run, sent, messagePlayer, events, store };
   };
 
   it('sends each player on the leaderboard who joins their welcome back, the Discord and the website, privately, 2 minutes after the bot sees them', async () => {
     // a and b are on when the bot starts; c joins by minute 2, d by minute 3.
-    const { run, sent, log } = welcomePoller([
+    const { run, sent, events } = welcomePoller([
       snapshot([a, b]),
       snapshot([a, b, c]),
       snapshot([a, b, c, d]),
@@ -1076,7 +1077,8 @@ describe('welcomes', () => {
       [4, 'c', textFor('c')],
       [5, 'd', textFor('d')],
     ]);
-    expect(log.info).toHaveBeenCalledWith(`Sent welcome to "Pc" (c): ${textFor('c')}`);
+    expect(lines(events)).toContainEqual(['Welcome sent']);
+    expect(JSON.stringify(events)).not.toContain(textFor('c'));
   });
 
   it('welcomes a player on the leaderboard back, by name and with their place', async () => {
@@ -1134,7 +1136,7 @@ describe('welcomes', () => {
   });
 
   it('sends no welcome when it cannot read the leaderboard', async () => {
-    const { run, sent, log } = welcomePoller(
+    const { run, sent, events } = welcomePoller(
       [snapshot([a, b]), snapshot([a, b, c]), ...Array.from({ length: 4 }, () => snapshot([a, b, c]))],
       {},
       undefined,
@@ -1147,7 +1149,7 @@ describe('welcomes', () => {
     await run(5);
 
     expect(sent).toEqual([]);
-    expect(log.error).toHaveBeenCalledWith('Reading the leaderboard failed, so welcomes leave it out: storage down');
+    expect(errors(events)).toContainEqual(['Reading the leaderboard failed, so welcomes leave it out', 'storage down']);
   });
 
   it('leaves the Discord invite out for a player who linked their account on the website, and gives it to the rest', async () => {
@@ -1167,7 +1169,7 @@ describe('welcomes', () => {
   });
 
   it('still gives the invite when it cannot tell who linked', async () => {
-    const { run, sent, log } = welcomePoller(
+    const { run, sent, events } = welcomePoller(
       [snapshot([a, b]), snapshot([a, b, c]), ...Array.from({ length: 4 }, () => snapshot([a, b, c]))],
       {},
       undefined,
@@ -1179,7 +1181,7 @@ describe('welcomes', () => {
     await run(5);
 
     expect(sent).toEqual([[4, 'c', textFor('c')]]);
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('storage down'));
+    expect(errors(events)).toContainEqual([expect.any(String), expect.stringContaining('storage down')]);
   });
 
   it("does not welcome players already on when the bot's first reading lists nobody but the server says it has players", async () => {
@@ -1221,13 +1223,13 @@ describe('welcomes', () => {
   });
 
   it('logs a failed welcome and does not send it again', async () => {
-    const { run, messagePlayer, log } = welcomePoller([snapshot([]), ...Array.from({ length: 5 }, () => snapshot([a]))]);
+    const { run, messagePlayer, events } = welcomePoller([snapshot([]), ...Array.from({ length: 5 }, () => snapshot([a]))]);
     messagePlayer.mockRejectedValue(new Error('RCON request failed: POST /v1/players/a/message 404 (player_not_found)'));
 
     await run(6);
 
     expect(messagePlayer).toHaveBeenCalledTimes(1);
-    expect(log.error).toHaveBeenCalledWith('Welcome to "Pa" (a) failed: RCON request failed: POST /v1/players/a/message 404 (player_not_found)');
+    expect(errors(events)).toContainEqual(['Welcome failed', 'RCON request failed: POST /v1/players/a/message 404 (player_not_found)']);
   });
 
   it('sends none, and keeps no record, when welcomes are off', async () => {
@@ -1294,7 +1296,7 @@ describe('end-of-match messages', () => {
     const messagePlayer = vi.fn(async (steamId: string, message: string) => {
       sent.push([clock / 60_000, steamId, message]);
     });
-    const log = { info: vi.fn(), error: vi.fn() };
+    const { log, events } = memoryLog();
     const tick = createPoller({
       config: { ...config, matchEndMessages: rule, ...overrides },
       fetchSnapshot: async () => queue.shift() ?? snapshot([]),
@@ -1309,11 +1311,11 @@ describe('end-of-match messages', () => {
     const run = async (times: number) => {
       for (let i = 0; i < times; i++) await tick();
     };
-    return { run, sent, messagePlayer, log, store };
+    return { run, sent, messagePlayer, events, store };
   };
 
   it('tells the top players where they finished the moment a check sees a team win, once', async () => {
-    const { run, sent, log, store } = endPoller([...live, playing([100, 60]), playing([100, 60]), nextMap([a, b, c])]);
+    const { run, sent, events, store } = endPoller([...live, playing([100, 60]), playing([100, 60]), nextMap([a, b, c])]);
 
     await run(5);
 
@@ -1322,7 +1324,8 @@ describe('end-of-match messages', () => {
       [3, b, second],
       [3, c, third],
     ]);
-    expect(log.info).toHaveBeenCalledWith(`Sent end-of-match message to "Pa" (a): ${first}`);
+    expect(lines(events)).toContainEqual(['End-of-match message sent']);
+    expect(JSON.stringify(events)).not.toContain(first);
     expect((await store.load())?.endMessages).toBe(60_000);
   });
 
@@ -1354,12 +1357,12 @@ describe('end-of-match messages', () => {
     const liveMatch = vi.fn(async (): Promise<LiveMatch | null> => {
       throw new Error('storage gone');
     });
-    const { run, sent, log } = endPoller([...live, playing([100, 60])], { matchEndMessages: { ...rule, count: 1 } }, { liveMatch });
+    const { run, sent, events } = endPoller([...live, playing([100, 60])], { matchEndMessages: { ...rule, count: 1 } }, { liveMatch });
 
     await run(3);
 
     expect(sent).toEqual([[3, a, first]]);
-    expect(log.error).toHaveBeenCalledWith("Reading the kill feed's match failed, so its awards are left out: storage gone");
+    expect(errors(events)).toContainEqual(["Reading the kill feed's match failed, so its awards are left out", 'storage gone']);
   });
 
   it('sends a private profile nothing, and the others the place the match summary gives them', async () => {
@@ -1393,14 +1396,15 @@ describe('end-of-match messages', () => {
     const endExtras = vi.fn(async (): Promise<EndExtras> => {
       throw new Error('storage gone');
     });
-    const { run, sent, log } = endPoller([...live, playing([100, 60])], {}, { endExtras });
+    const { run, sent, events } = endPoller([...live, playing([100, 60])], {}, { endExtras });
 
     await run(3);
 
     expect(sent.map(([, steamId]) => steamId)).toEqual([a, b, c]);
-    expect(log.error).toHaveBeenCalledWith(
-      'Reading the records for the end of the match failed, so milestones and personal bests are left out: storage gone',
-    );
+    expect(errors(events)).toContainEqual([
+      'Reading the records for the end of the match failed, so milestones and personal bests are left out',
+      'storage gone',
+    ]);
   });
 
   it("says staff's lines", async () => {
@@ -1414,15 +1418,16 @@ describe('end-of-match messages', () => {
   });
 
   it('logs a failed message and does not send it again', async () => {
-    const { run, messagePlayer, log } = endPoller([...live, playing([100, 60]), playing([100, 60])], { matchEndMessages: { ...rule, count: 1 } });
+    const { run, messagePlayer, events } = endPoller([...live, playing([100, 60]), playing([100, 60])], { matchEndMessages: { ...rule, count: 1 } });
     messagePlayer.mockRejectedValue(new Error('RCON request failed: POST /v1/players/a/message 404 (player_not_found)'));
 
     await run(4);
 
     expect(messagePlayer).toHaveBeenCalledTimes(1);
-    expect(log.error).toHaveBeenCalledWith(
-      'End-of-match message to "Pa" (a) failed: RCON request failed: POST /v1/players/a/message 404 (player_not_found)',
-    );
+    expect(errors(events)).toContainEqual([
+      'End-of-match message failed',
+      'RCON request failed: POST /v1/players/a/message 404 (player_not_found)',
+    ]);
   });
 
   it('sends none when they are off, or for a match that was already live when the bot started', async () => {
@@ -1447,7 +1452,7 @@ describe('end-of-match messages', () => {
       const messagePlayer = vi.fn(async (steamId: string, message: string) => {
         sent.push([steamId, message]);
       });
-      const log = { info: vi.fn(), error: vi.fn() };
+      const { log, events } = memoryLog();
       const check = createMatchEndCheck({
         config: { ...config, matchEndMessages: rule },
         fetchSnapshot: async () => {
@@ -1462,7 +1467,7 @@ describe('end-of-match messages', () => {
         matchFeed: async () => result(),
         ...deps,
       });
-      return { check, sent, log };
+      return { check, sent, events };
     };
 
     it('sends them at once, whatever the scores the server shows, and the next check sends none', async () => {
@@ -1526,10 +1531,10 @@ describe('end-of-match messages', () => {
     it('logs a failed read and never throws', async () => {
       const store = memoryStore();
       await endPoller(live, {}, { store }).run(2);
-      const { check, log } = endCheck(store, new Error('fetch failed'));
+      const { check, events } = endCheck(store, new Error('fetch failed'));
 
       await expect(check()).resolves.toBeUndefined();
-      expect(log.error).toHaveBeenCalledWith('Match end check failed: fetch failed');
+      expect(errors(events)).toContainEqual(['Match end check failed', 'fetch failed']);
     });
   });
 });
@@ -1554,7 +1559,7 @@ describe('outages', () => {
         sent.push(message);
       },
       now: () => (clock += MINUTE),
-      log: { info: vi.fn(), error: vi.fn() },
+      log: memoryLog().log,
       store: memoryStore(),
       outage: async (event) => {
         told.push(event);
@@ -1706,7 +1711,7 @@ describe('in-game messages', () => {
     voting?: () => Promise<boolean>,
   ) => {
     const queue = [...snapshots];
-    const log = { info: vi.fn(), error: vi.fn() };
+    const { log, events } = memoryLog();
     let clock = 0;
     const tick = createPoller({
       config: { ...config, matchMessages },
@@ -1722,7 +1727,7 @@ describe('in-game messages', () => {
       ...(lines === undefined ? {} : { lines }),
       ...(voting === undefined ? {} : { voting }),
     });
-    return { run: async (times: number) => { for (let i = 0; i < times; i++) await tick(); }, broadcast, log };
+    return { run: async (times: number) => { for (let i = 0; i < times; i++) await tick(); }, broadcast, events };
   };
 
   const matchSnapshots = () => [
@@ -1736,7 +1741,7 @@ describe('in-game messages', () => {
   ];
 
   it('sends each message once as the match goes on, and saves which were sent', async () => {
-    const { run, broadcast, log } = messagesPoller([
+    const { run, broadcast, events } = messagesPoller([
       withScores(crowd(5), 0, 0),
       withScores(crowd(22), 5, 3),
       withScores(crowd(22), 20, 12),
@@ -1753,9 +1758,7 @@ describe('in-game messages', () => {
       'Halfway there! Valkyra leads on 52. Not my points, OUR points, comrade. Watch this match live: gaminginit.com/live',
       'Valkyra has 90! Victory for the motherland is in sight, comrades. Where do you rank? gaminginit.com',
     ]);
-    expect(log.info).toHaveBeenCalledWith(
-      'Sent in game: Halfway there! Valkyra leads on 52. Not my points, OUR points, comrade. Watch this match live: gaminginit.com/live',
-    );
+    expect(lines(events)).toContainEqual(['In-game message sent']);
   });
 
   it('sends people to the vote at halfway and last call only while they can vote', async () => {
@@ -1779,7 +1782,7 @@ describe('in-game messages', () => {
     const broadcast = vi.fn(async (_message: string) => {
       throw new Error('RCON request timed out after 8000ms');
     });
-    const { run, log } = messagesPoller(
+    const { run, events } = messagesPoller(
       [withScores(crowd(5), 0, 0), withScores(crowd(22), 52, 3), withScores(crowd(22), 60, 3), withScores(crowd(22), 70, 3)],
       broadcast,
     );
@@ -1788,7 +1791,7 @@ describe('in-game messages', () => {
 
     // Halfway fails once and is not tried again; ten minutes in is a different message, due on the last check.
     expect(broadcast.mock.calls.map(([m]) => m.split('!')[0].split('?')[0])).toEqual(['Halfway there', "10 minutes in and nobody's rage quit yet. See where your K/D ranks: gaminginit.com"]);
-    expect(log.error).toHaveBeenCalledWith('In-game message failed: RCON request timed out after 8000ms');
+    expect(errors(events)).toContainEqual(['In-game message failed', 'RCON request timed out after 8000ms']);
   });
 
   it("says the lines staff put in place of the bot's", async () => {
@@ -1811,14 +1814,14 @@ describe('in-game messages', () => {
   });
 
   it("says the bot's own lines when staff's can't be read, and logs it", async () => {
-    const { run, broadcast, log } = messagesPoller(matchSnapshots(), undefined, on, async () => {
+    const { run, broadcast, events } = messagesPoller(matchSnapshots(), undefined, on, async () => {
       throw new Error('storage is down');
     });
 
     await run(7);
 
     expect(broadcast.mock.calls.map(([m]) => m.split(' ')[0])).toEqual(['10', 'Halfway', 'Valkyra']);
-    expect(log.error).toHaveBeenCalledWith("Reading the in-game lines failed, so the bot's own are used: storage is down");
+    expect(errors(events)).toContainEqual(["Reading the in-game lines failed, so the bot's own are used", 'storage is down']);
   });
 
   describe('while seeding', () => {
@@ -1837,7 +1840,7 @@ describe('in-game messages', () => {
         fetchSnapshot: async () => queue.shift() ?? snapshot([]),
         send: vi.fn(async () => {}),
         now: () => (clock += 60_000),
-        log: { info: vi.fn(), error: vi.fn() },
+        log: memoryLog().log,
         store: memoryStore(),
         broadcast,
         random: () => 0,
@@ -1909,7 +1912,7 @@ describe('in-game messages', () => {
         sent.push([second, short(message)]);
       });
       const fetchPlayers = vi.fn(async () => who(second));
-      const log = { info: vi.fn(), error: vi.fn() };
+      const { log, events } = memoryLog();
       const deps = {
         config: { ...config, seedingMessages: every5, ...overrides },
         now: () => second * 1000,
@@ -1927,7 +1930,7 @@ describe('in-game messages', () => {
           else await joinCheck();
         }
       };
-      return { runUntil, sent, fetchPlayers, joinCheck, log };
+      return { runUntil, sent, fetchPlayers, joinCheck, events };
     };
 
     // n players, and from these seconds on, one more each.
@@ -2061,12 +2064,12 @@ describe('in-game messages', () => {
     });
 
     it('logs a failed read and keeps checking', async () => {
-      const { runUntil, joinCheck, fetchPlayers, log } = joinBot(() => crowd(5));
+      const { runUntil, joinCheck, fetchPlayers, events } = joinBot(() => crowd(5));
       await runUntil(60);
       fetchPlayers.mockRejectedValueOnce(new Error('RCON request timed out after 8000ms'));
 
       await expect(joinCheck()).resolves.toBe(true);
-      expect(log.error).toHaveBeenCalledWith('Join check failed: RCON request timed out after 8000ms');
+      expect(errors(events)).toContainEqual(['Join check failed', 'RCON request timed out after 8000ms']);
     });
   });
 
@@ -2096,7 +2099,7 @@ describe("the kill feed's joins while seeding", () => {
   // A check at 60 seconds finds a, b and c seeding.
   const seeding = async (overrides: Partial<Config> = {}, players = [player('a'), player('b'), player('c')]) => {
     const store = memoryStore();
-    const deps = { config: { ...config, seedingMessages: every5, ...overrides }, log: { info: vi.fn(), error: vi.fn() }, store };
+    const deps = { config: { ...config, seedingMessages: every5, ...overrides }, log: memoryLog().log, store };
     await createPoller({ ...deps, fetchSnapshot: async () => snapshot(players), send: vi.fn(async () => {}), now: () => 60_000 })();
     return { ...deps, feedJoins: createFeedJoins(deps) };
   };
