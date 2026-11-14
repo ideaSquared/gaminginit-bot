@@ -80,11 +80,11 @@ export const sendDirectMessage = async (
 ): Promise<'sent' | 'closed'> => {
   const call = botCall(botToken, fetchFn);
   const opened = await call('/users/@me/channels', 'POST', { recipient_id: userId });
-  if (!opened.ok) throw new Error(`Discord would not open a message to ${userId}: ${opened.status} ${await opened.text()}`);
+  if (!opened.ok) throw new Error(`Discord would not open a message: ${opened.status} ${await opened.text()}`);
   const { id } = z.object({ id: z.string() }).parse(await opened.json());
   const sent = await call(`/channels/${id}/messages`, 'POST', { content, allowed_mentions: { parse: [] } });
   if (sent.ok) return 'sent';
   const code = z.object({ code: z.number() }).safeParse(await sent.json().catch(() => null));
   if (sent.status === 403 && code.success && code.data.code === DMS_CLOSED) return 'closed';
-  throw new Error(`Discord refused the message to ${userId}: ${sent.status}`);
+  throw new Error(`Discord refused the message: ${sent.status}`);
 };

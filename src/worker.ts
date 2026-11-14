@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { DurableObject } from 'cloudflare:workers';
 import { isQuiet, withSeedCall } from './alerts.ts';
 import { loadConfig } from './config.ts';
-import { log } from './log.ts';
+import { log, type Log } from './log.ts';
 import {
   castVote,
   inGameProblem,
@@ -348,6 +348,7 @@ import {
   parseOnline,
   PLAYER_ID,
   publicId,
+  staffTag,
   type DayRecords,
   type OnlineNow,
   type OnlineSnapshot,
@@ -4066,13 +4067,14 @@ export class Watcher extends DurableObject<Env> {
   // Staff giving or taking coins. The reason and who did it are in the player's log.
   async coinsAdjust({ steamId, name, delta, reason, by, byName }: Named & { delta: number; reason: string; by: string; byName?: string }): Promise<number | null> {
     if ((await this.coinRule()) === null) return null;
+    const actor = await this.staffActor(by);
     return this.coining(async () => {
       const now = Date.now();
       const key = coinKey(steamId);
       const account = parseCoins(await this.ctx.storage.get(key)) ?? blankAccount(name, now);
       const next = adjustCoins(rolled(account, now), delta, `${reason} (${byName ?? by})`.slice(0, 120), now);
       await this.ctx.storage.put(key, next);
-      log.info('INITcoins adjusted by staff', { action: delta >= 0 ? 'give' : 'take', count: Math.abs(delta) });
+      log.info('INITcoins adjusted by staff', { actor, action: delta >= 0 ? 'give' : 'take', count: Math.abs(delta) });
       return next.balance;
     });
   }
@@ -4515,6 +4517,11 @@ export class Watcher extends DurableObject<Env> {
     return this.idKey;
   }
 
+  // The anonymous tag the logs carry for a staff member's actions, for the edge Worker, which has no key of its own.
+  async staffActor(userId: string): Promise<string> {
+    return staffTag(await this.publicIdKey(), userId);
+  }
+
   // Works out the public ids it does not know yet, and returns every id it knows, by Steam ID.
   private async idsFor(steamIds: Iterable<string>): Promise<Map<string, string>> {
     const missing = [...new Set(steamIds)].filter((steamId) => !this.ids.has(steamId));
@@ -4765,6 +4772,7 @@ export class Watcher extends DurableObject<Env> {
     action: ProfileAction,
     user: { id: string; name: string },
   ): Promise<{ steamId: string | null; player: string | null } | { problem: string }> {
+    const actor = await this.staffActor(user.id);
     // One at a time with the VIP updates: one that read the staff before this change and is still writing the whitelist
     // would otherwise save VIP for an account linked meanwhile. Waiting for it makes it come before the link.
     const changed = await this.serial(async (): Promise<{ steamId: string | null } | { problem: string }> => {
@@ -4775,7 +4783,7 @@ export class Watcher extends DurableObject<Env> {
         const was = profiles[target];
         if (was === undefined) return { steamId: null };
         await storage.put(STAFF_PROFILES_KEY, unlinkSteam(profiles, target));
-        log.info('Staff page: Steam account unlinked');
+        log.info('Staff page: Steam account unlinked', { actor });
         return { steamId: null };
       }
       const linked = linkSteam(profiles, user, action.steamId, Date.now());
@@ -4786,7 +4794,7 @@ export class Watcher extends DurableObject<Env> {
         return { problem: 'That Steam account is linked to a player, who proved it with their Discord profile or Steam. Check the ID.' };
       }
       await storage.put(STAFF_PROFILES_KEY, linked.profiles);
-      log.info('Staff page: Steam account linked');
+      log.info('Staff page: Steam account linked', { actor });
       return { steamId: linked.steamId };
     });
     if ('problem' in changed) return changed;
@@ -5785,6 +5793,18 @@ const publicRoute = (
 // be listed under OAuth2 → Redirects in the Discord Developer Portal.
 const callbackUrl = (request: Request): string => `${new URL(request.url).origin}${CALLBACK_PATH}`;
 
+// The log with the staff member's anonymous tag on every event, so their actions can be followed without naming them.
+// The tag is made from a key only the Durable Object holds; if it cannot be read, the events go untagged.
+const actorLog = async (watcher: () => DurableObjectStub<Watcher>, userId: string | null | undefined): Promise<Log> => {
+  if (!userId) return log;
+  try {
+    return log.with({ actor: await watcher().staffActor(userId) });
+  } catch (error) {
+    log.warn('Staff actor tag unavailable, so events are untagged', {}, error);
+    return log;
+  }
+};
+
 // Logged each time, so the reason the staff page cannot load is in the Worker logs, not only on the page.
 const notSetUp = (missing: string[]): Response => {
   log.error('Staff sign-in is not set up on the bot', { missing: missing.join(', ') });
@@ -5834,8 +5854,8 @@ const staffCallback = async (request: Request, vars: Record<string, string>, wat
       log.info('Staff sign-in refused', { why: result.problem });
       return back(`error=${result.problem}`);
     }
-    log.info('Staff signed in');
     const { id, name, username } = result.user;
+    (await actorLog(watcher, id)).info('Staff signed in');
     await watcher()
       .noteStaff(id, name, username)
       .catch((error: unknown) => log.error('Noting a staff name failed', {}, error));
@@ -6136,8 +6156,9 @@ const commandTools = (
     buy: (userId, item) => watcher().coinsAct(userId, { action: 'buy', item }),
     items: () => watcher().coinsShop(),
   };
-  return {
-    run: runCommand({
+  // Staff-only commands log with the staff member's anonymous tag; the rest, run by players, stay untagged.
+  const runAs = async (request: CommandRequest): Promise<CommandReply> =>
+    runCommand({
       config: () => loadConfig(vars),
       http: socketHttp(connect),
       lastMatch: async () => (await watcher().recentMatches())[0] ?? null,
@@ -6150,8 +6171,10 @@ const commandTools = (
       records,
       coins,
       now: Date.now,
-      log,
-    }),
+      log: isAdminCommand(request.name) ? await actorLog(watcher, request.userId) : log,
+    })(request);
+  return {
+    run: runAs,
     suggest: suggestOptions({
       recentMatches: () => watcher().recentMatches(),
       config: () => loadConfig(vars),
@@ -6225,6 +6248,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
   }
   const session = await readSession(config.clientSecret, request.headers.get('authorization'), Date.now());
   if (session === null) return Response.json({ error: 'Sign in again' }, { status: 401, headers });
+  const slog = await actorLog(watcher, session.userId);
   const url = new URL(request.url);
   const route = `${request.method} ${url.pathname}`;
   if (route === 'GET /api/admin/commands') return Response.json({ commands: ADMIN_COMMAND_DEFINITIONS }, { headers });
@@ -6239,7 +6263,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const focused = body.focused ?? '';
       if (!isOptionOf(name, focused, options['subcommand'])) return Response.json({ choices: [] }, { headers });
       const choices = await tools.suggest({ name, options, userId: session.userId, focused }).catch((error: unknown) => {
-        log.error('Staff page: command suggestions failed', { command: name }, error);
+        slog.error('Staff page: command suggestions failed', { command: name }, error);
         return [];
       });
       return Response.json({ choices }, { headers });
@@ -6247,12 +6271,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     // Checked as Discord checks a slash command, then run by the same code, as the signed-in staff member.
     const checked = checkOptions(name, body.options);
     if ('problem' in checked) return Response.json({ error: checked.problem }, { status: 400, headers });
-    log.info('Staff page: command used', { command: name });
+    slog.info('Staff page: command used', { command: name });
     try {
       const reply = await tools.run({ name, options: checked.options, userId: session.userId, userName: session.name });
       return Response.json(reply, { headers });
     } catch (error) {
-      log.error('Staff page: command failed', { command: name }, error);
+      slog.error('Staff page: command failed', { command: name }, error);
       return Response.json({ error: failureText(name, error) }, { status: 502, headers });
     }
   }
@@ -6262,12 +6286,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/rotations') return Response.json(await watcher().rotationsPage(), { headers });
       const action = await readRotationAction(request);
       if (action === null) return Response.json({ error: 'Not a rotations request' }, { status: 400, headers });
-      log.info('Staff page: rotations changed', { action: action.action, rotation: action.name, maps: 'entries' in action ? action.entries.length : null, days: 'days' in action ? action.days.join(',') : null });
+      slog.info('Staff page: rotations changed', { action: action.action, rotation: action.name, maps: 'entries' in action ? action.entries.length : null, days: 'days' in action ? action.days.join(',') : null });
       const result = await watcher().rotationsAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page rotations failed', {}, error);
+      slog.error('Staff page rotations failed', {}, error);
       return Response.json({ error: "Couldn't reach the rotations right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6287,10 +6311,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (result.status === 'refused') {
         return Response.json({ error: `The server won't take it: ${result.reason}.` }, { status: 422, headers });
       }
-      log.info('Staff page: welcome message saved', { lines: edit.lines.length, enabled: edit.enabled });
+      slog.info('Staff page: welcome message saved', { lines: edit.lines.length, enabled: edit.enabled });
       return Response.json({ ...result.page, outcome: result.outcome }, { headers });
     } catch (error) {
-      log.error('Staff page welcome message failed', {}, error);
+      slog.error('Staff page welcome message failed', {}, error);
       const readOnly = errorText(error).includes('read-only');
       return Response.json(
         {
@@ -6308,12 +6332,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/lines') return Response.json(await watcher().linesPage(), { headers });
       const action = await readLinesAction(request);
       if (action === null) return Response.json({ error: 'Not a lines request' }, { status: 400, headers });
-      log.info('Staff page: lines changed', { action: action.action, list: action.list, lines: action.action === 'save' ? action.lines.length : null });
+      slog.info('Staff page: lines changed', { action: action.action, list: action.list, lines: action.action === 'save' ? action.lines.length : null });
       const result = await watcher().linesAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page lines failed', {}, error);
+      slog.error('Staff page lines failed', {}, error);
       return Response.json({ error: "Couldn't reach the lines right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6323,12 +6347,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/rules') return Response.json(await watcher().rulesPage(), { headers });
       const action = await readRulesAction(request);
       if (action === null) return Response.json({ error: 'Not a weapon rules request' }, { status: 400, headers });
-      log.info('Staff page: weapon rule changed', { action: action.action, rule: action.action === 'save' ? action.name : action.id });
+      slog.info('Staff page: weapon rule changed', { action: action.action, rule: action.action === 'save' ? action.name : action.id });
       const result = await watcher().rulesAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page weapon rules failed', {}, error);
+      slog.error('Staff page weapon rules failed', {}, error);
       return Response.json({ error: "Couldn't reach the weapon rules right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6339,7 +6363,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().chatFeed(after), { headers });
     } catch (error) {
-      log.error('Staff page live chat failed', {}, error);
+      slog.error('Staff page live chat failed', {}, error);
       return Response.json({ error: "Couldn't read the chat right now." }, { status: 503, headers });
     }
   }
@@ -6349,12 +6373,12 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if (route === 'GET /api/admin/chatwords') return Response.json(await watcher().chatWordsPage(), { headers });
       const action = await readWordsAction(request);
       if (action === null) return Response.json({ error: 'Not a chat filter request' }, { status: 400, headers });
-      log.info('Staff page: chat filter changed', { action: action.action, list: action.list });
+      slog.info('Staff page: chat filter changed', { action: action.action, list: action.list });
       const result = await watcher().chatWordsAction(action, session.userId, session.name);
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page chat filter failed', {}, error);
+      slog.error('Staff page chat filter failed', {}, error);
       return Response.json({ error: "Couldn't reach the chat filter right now. If it was a change, check before trying again." }, { status: 503, headers });
     }
   }
@@ -6368,7 +6392,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const chosen = season === 'shown' ? (seasonAt(now) ?? shownSeason(now)) : season;
       return Response.json(await watcher().season(chosen, true), { headers });
     } catch (error) {
-      log.error('Staff page season roundup failed', {}, error);
+      slog.error('Staff page season roundup failed', {}, error);
       return Response.json({ error: "Couldn't build the season roundup right now." }, { status: 503, headers });
     }
   }
@@ -6381,7 +6405,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       if ('problem' in result) return Response.json({ error: result.problem }, { status: 400, headers });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff profile change failed', {}, error);
+      slog.error('Staff profile change failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6391,10 +6415,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     if (action === null) return Response.json({ error: 'Not a check request' }, { status: 400, headers });
     try {
       const result = await watcher().checkPlayer(action, { id: session.userId, name: session.name });
-      log.info('Staff page: player check', { action: action.action, count: action.action === 'check' ? action.reasons.length : 0 });
+      slog.info('Staff page: player check', { action: action.action, count: action.action === 'check' ? action.reasons.length : 0 });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page check failed', {}, error);
+      slog.error('Staff page check failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6405,7 +6429,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await commandTools(vars, watcher).record(player), { headers });
     } catch (error) {
-      log.error('Staff page player record failed', {}, error);
+      slog.error('Staff page player record failed', {}, error);
       return Response.json({ error: "Couldn't load their record just now." }, { status: 503, headers });
     }
   }
@@ -6415,10 +6439,10 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     if (action === null) return Response.json({ error: 'Not a dealt-with request' }, { status: 400, headers });
     try {
       const result = await watcher().dealWith(action, { id: session.userId, name: session.name });
-      log.info('Staff page: player dealt with', { action: action.action, count: action.action === 'deal' ? action.reasons.length : 0 });
+      slog.info('Staff page: player dealt with', { action: action.action, count: action.action === 'deal' ? action.reasons.length : 0 });
       return Response.json(result, { headers });
     } catch (error) {
-      log.error('Staff page dealt-with failed', {}, error);
+      slog.error('Staff page dealt-with failed', {}, error);
       return Response.json({ error: "Couldn't save that just now. Try again in a minute." }, { status: 503, headers });
     }
   }
@@ -6427,7 +6451,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().adminLifetime(), { headers });
     } catch (error) {
-      log.error('Staff page lifetime failed', {}, error);
+      slog.error('Staff page lifetime failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6438,7 +6462,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const csv = await watcher().adminLifetimeCsv(table);
       return new Response(csv, { headers: { ...headers, 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="wardogs-${table}.csv"` } });
     } catch (error) {
-      log.error('Staff page lifetime export failed', {}, error);
+      slog.error('Staff page lifetime export failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6452,7 +6476,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
       const page = player === null ? await watcher().adminKills(days) : await watcher().adminPlayerKills(player, days);
       return Response.json(page, { headers });
     } catch (error) {
-      log.error('Staff page kills failed', {}, error);
+      slog.error('Staff page kills failed', {}, error);
       return Response.json({ error: 'The kill feed is unavailable' }, { status: 503, headers });
     }
   }
@@ -6461,7 +6485,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().adminRetention(days), { headers });
     } catch (error) {
-      log.error('Staff page play time failed', {}, error);
+      slog.error('Staff page play time failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6470,7 +6494,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     try {
       return Response.json(await watcher().discordGrowth(), { headers });
     } catch (error) {
-      log.error('Staff page Discord growth failed', {}, error);
+      slog.error('Staff page Discord growth failed', {}, error);
       return Response.json({ error: "Couldn't load the numbers just now." }, { status: 503, headers });
     }
   }
@@ -6479,7 +6503,7 @@ const staffApi = async (request: Request, vars: Record<string, string>, watcher:
     const overview = await watcher().adminOverview(days);
     return Response.json({ ...overview, user: { id: session.userId, name: session.name } }, { headers });
   } catch (error) {
-    log.error('Staff page failed', {}, error);
+    slog.error('Staff page failed', {}, error);
     return Response.json({ error: 'The staff page is unavailable' }, { status: 503, headers });
   }
 };

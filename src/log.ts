@@ -1,12 +1,14 @@
 import { createLogger, type Sink } from '@ideasquared/log';
 
-// Every field the bot may log. None identifies a player: no names, Steam IDs, Discord user IDs, chat text, IPs or
+// Every field the bot may log. `actor` is an anonymous tag of the staff member who acted (see staffTag), never their
+// Discord user ID. None identifies a player: no names, Steam IDs, Discord user IDs, chat text, IPs or
 // tokens. Counts, map and faction names, outcomes and rule ids are what is left to describe an event.
 export const createBotLog = (sink?: Sink) =>
   createLogger({
     service: 'wardogs-discord-bot',
     fields: [
       'action',
+      'actor',
       'added',
       'ballots',
       'banned',

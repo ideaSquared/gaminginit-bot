@@ -36,6 +36,10 @@ export const publicId = async (key: CryptoKey, steamId: string): Promise<string>
   return hex(new Uint8Array(mac, 0, 6));
 };
 
+// A staff member's tag for the logs: the same HMAC, over "staff:<Discord user id>", so it is stable and cannot be turned
+// back into the user, and never equals a player's public id (their input is a Steam ID, which is only digits).
+export const staffTag = (key: CryptoKey, discordUserId: string): Promise<string> => publicId(key, `staff:${discordUserId}`);
+
 // Who was in game at the last check that reached the server. It is stored with each check, so player pages still
 // know who is online after the Durable Object restarts. `map` is as RCON names it.
 export type OnlineSnapshot = { at: number; map: string; players: Player[] };

@@ -1,3 +1,4 @@
+import { createLogger, memorySink } from '@ideasquared/log';
 import { describe, expect, it } from 'vitest';
 import {
   addRotationEntry,
@@ -319,7 +320,7 @@ describe('staff actions', () => {
     const missing = await addBan(RCON, 'secret', ASH, 'Cheating', http).catch((error: unknown) => error);
     const broken = await addBan(RCON, 'secret', ASH, 'Cheating', http).catch((error: unknown) => error);
 
-    expect(String(refused)).toContain(`POST /v1/bans 404 (player_not_found: Error: no player matching '${ASH}'.)`);
+    expect(String(refused)).toContain(`POST /v1/bans 404 (player_not_found: Error: no player matching ':id'.)`);
     expect([refused, missing, broken].map(isNotInGame)).toEqual([true, false, false]);
     expect(String(broken)).toContain('POST /v1/bans 500');
     expect(isNotInGame(new Error('player_not_found'))).toBe(false);
@@ -579,5 +580,49 @@ describe('the chat route', () => {
     for (const raw of [{}, { ok: true }, { messages: 'none' }, { lines: [] }, [real.messages[0]], 'text', 5, null]) {
       expect(() => parseChat(raw, NOW), JSON.stringify(raw)).toThrow('no messages list');
     }
+  });
+});
+
+describe('RCON errors keep Steam IDs out', () => {
+  const STEAM = '76561198000000001';
+  const url = 'http://203.0.113.10:7776';
+
+  it('names the route, not the player, when a request to a player fails', async () => {
+    const { get } = respondWith(404, { error: { code: 'player_not_found', message: `No player ${STEAM}` } });
+    const failures = await Promise.all([
+      messagePlayer(url, 'secret', STEAM, 'hi', get).catch((e: unknown) => e),
+      kickPlayer(url, 'secret', STEAM, 'rule', get).catch((e: unknown) => e),
+      switchFaction(url, 'secret', STEAM, 'Kharr', get).catch((e: unknown) => e),
+      addBan(url, 'secret', STEAM, 'cheating', get).catch((e: unknown) => e),
+    ]);
+    const removal = await removeBan(url, 'secret', STEAM, respondWith(500, 'oops').get).catch((e: unknown) => e);
+    for (const failure of [...failures, removal]) {
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).not.toContain(STEAM);
+    }
+    expect((failures[0] as Error).message).toBe('RCON request failed: POST /v1/players/:id/message 404 (player_not_found: No player :id)');
+    expect((removal as Error).message).toBe('RCON request failed: DELETE /v1/bans/:id 500');
+  });
+
+  it('refuses a malformed Steam ID without repeating it', async () => {
+    const { get } = respondWith(200, {});
+    const bad = '7656119800000000x';
+    for (const call of [
+      () => messagePlayer(url, 'secret', bad, 'hi', get),
+      () => addBan(url, 'secret', bad, 'why', get),
+      () => removeBan(url, 'secret', bad, get),
+    ]) {
+      await expect(call()).rejects.toThrow(new Error('Not a Steam ID'));
+    }
+  });
+
+  it('leaves a log event without the Steam ID when the failure is logged', async () => {
+    const sink = memorySink();
+    const log = createLogger({ service: 'test', fields: [], sink });
+    const error = await messagePlayer(url, 'secret', STEAM, 'hi', respondWith(404, { error: { code: 'player_not_found' } }).get).catch((e: unknown) => e);
+    log.error('In-game message failed', {}, error);
+    expect(sink.events).toHaveLength(1);
+    expect(JSON.stringify(sink.events)).not.toContain(STEAM);
+    expect(JSON.stringify(sink.events)).toContain('/v1/players/:id/message');
   });
 });

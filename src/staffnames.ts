@@ -75,7 +75,7 @@ export const fetchDiscordUser = async (
     signal: AbortSignal.timeout(5_000),
   });
   if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Discord did not say who user ${id} is: ${response.status}`);
+  if (!response.ok) throw new Error(`Discord did not say who the user is: ${response.status}`);
   const user = UserSchema.parse(await response.json());
   return { name: user.global_name || user.username, username: user.username };
 };

@@ -12,6 +12,7 @@ import {
   PROFILE_MATCHES,
   publicBan,
   publicId,
+  staffTag,
   type DayRecords,
   type ProfileSources,
 } from '../src/profiles.ts';
@@ -283,5 +284,27 @@ describe('publicBan', () => {
   it("falls back on the bot's record when the server's list could not be read", () => {
     expect(publicBan(ours, undefined, NOON)).toEqual({ reason: 'Teamkilling', until: null });
     expect(publicBan(null, undefined, NOON)).toBeNull();
+  });
+});
+
+describe('staffTag', () => {
+  const STAFFER = '100000000000000003';
+
+  it('is stable for one staff member, differs between staff, and is 12 hex characters', async () => {
+    const key = await importIdKey(newIdKey());
+    const tag = await staffTag(key, STAFFER);
+    expect(tag).toMatch(PLAYER_ID);
+    expect(await staffTag(key, STAFFER)).toBe(tag);
+    expect(await staffTag(key, '100000000000000004')).not.toBe(tag);
+  });
+
+  it('does not equal the player id made from the same digits, and does not contain the user id', async () => {
+    const key = await importIdKey(newIdKey());
+    expect(await staffTag(key, ASH)).not.toBe(await publicId(key, ASH));
+    expect(await staffTag(key, STAFFER)).not.toContain(STAFFER);
+  });
+
+  it('changes with the key', async () => {
+    expect(await staffTag(await importIdKey(newIdKey()), STAFFER)).not.toBe(await staffTag(await importIdKey(newIdKey()), STAFFER));
   });
 });
