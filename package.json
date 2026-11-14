@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@ideasquared/log": "https://github.com/ideaSquared/agent-idea/releases/download/log-v0.1.1/ideasquared-log-0.1.1.tgz",
-    "zod": "^4.6.5"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260930.1",
