@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import type { BlockedCircles } from './circles.ts';
 import { CHAT_MAX_LINES, CHAT_REPLY_LINES, chatReply } from './chatmod.ts';
 import { offMapIds, type VoteOptions } from './voteoptions.ts';
@@ -156,7 +157,7 @@ export type StaffDeps = {
   http: HttpClient;
   records: StaffRecords;
   now: () => number;
-  log: { info: (message: string) => void };
+  log: Log;
 };
 
 export const STAFF_COMMANDS = ['warn', 'player', 'kick', 'switchteam', 'moveclan', 'ban', 'unban', 'setnextmap', 'changemap', 'lighting', 'vip', 'rotations', 'private', 'circles', 'voteoptions', 'coinadmin', 'chat'] as const;
@@ -226,7 +227,6 @@ const unix = (at: number): number => Math.floor(at / 1000);
 const who = (player: Named): string => `**${playerName(player.name)}**`;
 
 // For the logs: JSON quoting keeps line breaks in names and messages from faking extra log lines.
-const logged = (player: Named): string => `${JSON.stringify(player.name)} (${player.steamId})`;
 
 // Discord caps a message at 2000 characters, so /private list names at most this many.
 const PRIVATE_LISTED = 15;
@@ -511,7 +511,7 @@ export const runStaffCommand =
       const target = await onlineTarget();
       if ('problem' in target) return { content: target.problem };
       const { player } = target;
-      log.info(`/warn by ${staff} to ${logged(player)}: ${JSON.stringify(message)}`);
+      log.info('Staff command used', { command: 'warn' });
       await messagePlayer(rconUrl, rconPassword, player.steamId, staffWarning(message, siteUrl), http);
       await records.log(player.steamId, { action: 'warn', at: now(), by, ...named, name: player.name, reason: message });
       return { content: `⚠️ Warned ${who(player)} in game: ${message}` };
@@ -530,7 +530,7 @@ export const runStaffCommand =
       const target = await onlineTarget();
       if ('problem' in target) return { content: target.problem };
       const { player } = target;
-      log.info(`/kick by ${staff}: ${logged(player)}: ${JSON.stringify(reason)}`);
+      log.info('Staff command used', { command: 'kick' });
       await kickPlayer(rconUrl, rconPassword, player.steamId, kickReason(reason, siteUrl), http);
       await records.log(player.steamId, { action: 'kick', at: now(), by, ...named, name: player.name, reason });
       return { content: `👢 Kicked ${who(player)}: ${reason}` };
@@ -557,7 +557,7 @@ export const runStaffCommand =
         return { content: known ? `${known} is not in this match. Teams now: ${teams.join(', ')}.` : `Pick a team: ${teams.join(', ') || 'none found'}.` };
       }
       if (same(team, current)) return { content: `${who(player)} is already on ${team}.` };
-      log.info(`/switchteam by ${staff}: ${logged(player)} from ${current ?? 'unknown'} to ${team}`);
+      log.info('Staff command used', { command: 'switchteam', from: current ?? 'unknown', target: team });
       await switchFaction(rconUrl, rconPassword, player.steamId, team, http);
       await records.log(player.steamId, {
         action: 'switchteam',
@@ -592,7 +592,7 @@ export const runStaffCommand =
           content: `${factionBadge(team)}**${team}** has ${onTeam} of ${TEAM_MAX_PLAYERS} players and room for ${free} more, but ${moving.length} with the tag "${tag}" would move. No one was moved.`,
         };
       }
-      log.info(`/moveclan by ${staff}: ${JSON.stringify(tag)} (${moving.length} players) to ${team}`);
+      log.info('Staff command used', { command: 'moveclan', target: team, count: moving.length });
       const failed: Player[] = [];
       for (const p of moving) {
         try {
@@ -636,7 +636,7 @@ export const runStaffCommand =
       const { found, live } = await anyTarget('player');
       if ('problem' in found) return { content: found.problem };
       const { player } = found;
-      log.info(`/ban by ${staff}: ${logged(player)} for ${length.name}: ${JSON.stringify(reason)}`);
+      log.info('Staff command used', { command: 'ban', kind: length.name });
       const result = await records.ban({ ...player, length: length.value, reason, by, ...named });
       const joining = 'the bot bans and kicks them within a minute of them joining';
       if (result.outcome === 'already-banned') {
@@ -668,7 +668,7 @@ export const runStaffCommand =
       const { found } = await anyTarget('steam_id');
       if ('problem' in found) return { content: found.problem };
       const { player } = found;
-      log.info(`/unban by ${staff}: ${logged(player)}`);
+      log.info('Staff command used', { command: 'unban' });
       return (await records.unban(player, by, userName))
         ? { content: `✅ Unbanned ${who(player)}. They can join again.` }
         : { content: `${who(player)} isn't banned.` };
@@ -691,12 +691,12 @@ export const runStaffCommand =
       const planned = planSetup(map.id, options, { rotation, mapExperiences, experiences, lightings, zones });
       if ('problem' in planned) return { content: planned.problem };
       const { setup, labels } = planned;
-      log.info(`/${name} by ${staff}: ${map.id} ${JSON.stringify(setup)}`);
+      log.info('Staff command used', { command: name, map: map.id, setup: JSON.stringify(setup) });
       await queueMap(rconUrl, rconPassword, map.id, http, setup);
       // Read now: the bot's own reading can be up to a minute old, from before a map change.
       const playing = status?.map || rotation?.entries.find((e) => e.status === 'now')?.map || null;
       // The map is staged on the server either way; only the live status would miss it.
-      await records.nextMap(map.id, playing).catch((error: unknown) => log.info(`Next map not noted for the live status: ${String(error)}`));
+      await records.nextMap(map.id, playing).catch((error: unknown) => log.warn('Next map not noted for the live status', {}, error));
       const described = [`${mapEmoji(map.id)}**${mapLabel(map)}**`, ...labels].join(' · ');
       if (name === 'setnextmap') {
         return { content: `🗺️ Next map: ${described}. The server goes there when this match ends; the rotation is unchanged.` };
@@ -710,7 +710,7 @@ export const runStaffCommand =
       const typed = (options['lighting'] ?? '').trim().toLowerCase();
       const chosen = lightings.find((l) => l.id.toLowerCase() === typed) ?? lightings.find((l) => l.name.toLowerCase() === typed);
       if (chosen === undefined) return { content: 'Pick a lighting from the list.' };
-      log.info(`/lighting by ${staff}: ${chosen.id}`);
+      log.info('Staff command used', { command: 'lighting', choice: chosen.id });
       await setLighting(rconUrl, rconPassword, chosen.id, http);
       return { content: `💡 Lighting changed to **${chosen.name}** for the match on now. The next map plays with its own lighting.` };
     }
@@ -722,7 +722,7 @@ export const runStaffCommand =
       const { found } = await anyTarget('steam_id');
       if ('problem' in found) return { content: found.problem };
       const { player } = found;
-      log.info(`/private ${options['subcommand'] === 'remove' ? 'remove' : 'add'} by ${staff}: ${logged(player)}`);
+      log.info('Staff command used', { command: 'private', action: options['subcommand'] === 'remove' ? 'remove' : 'add' });
       if (options['subcommand'] === 'remove') {
         return (await records.makePublic(player.steamId))
           ? { content: `🔓 ${who(player)}'s profile is public again. The website and Discord show their name within a minute.` }
@@ -742,7 +742,7 @@ export const runStaffCommand =
       if (options['subcommand'] === 'unblock') {
         const id = text('circle');
         const blocked = (await records.blockedCircles())[id];
-        log.info(`/circles unblock by ${staff}: ${JSON.stringify(id)}`);
+        log.info('Staff command used', { command: 'circles', action: 'unblock' });
         if (blocked === undefined || !(await records.unblockCircle(id))) return { content: "That circle isn't blocked. /circles list shows the blocked ones." };
         return { content: `✅ **${blocked.name}** on ${mapEmoji(blocked.map)}**${mapName(blocked.map)}** is allowed again. Map votes can give it to a winning map.` };
       }
@@ -753,7 +753,7 @@ export const runStaffCommand =
       const typed = text('circle').toLowerCase();
       const circle = layouts.find((z) => z.id.toLowerCase() === typed) ?? layouts.find((z) => z.name.toLowerCase() === typed);
       if (circle === undefined) return { content: `${mapName(map)} has no circles called "${text('circle')}". Pick one from the list.` };
-      log.info(`/circles block by ${staff}: ${JSON.stringify(circle.id)}`);
+      log.info('Staff command used', { command: 'circles', action: 'block' });
       if (!(await records.blockCircle({ id: circle.id, map, name: circle.name }, by, userName))) {
         return { content: `**${circle.name}** on ${mapName(map)} is already blocked.` };
       }
@@ -772,7 +772,7 @@ export const runStaffCommand =
       const enabled = options['enabled'] === 'true';
       const onOff = enabled ? 'on' : 'off';
       if (options['subcommand'] === 'rain') {
-        log.info(`/voteoptions rain ${onOff} by ${staff}`);
+        log.info('Staff command used', { command: 'voteoptions', what: 'rain', action: onOff });
         if (!(await records.setVoteRain(enabled, by, userName))) return { content: `Rain is already ${onOff} in map votes.` };
         return {
           content: enabled
@@ -782,7 +782,7 @@ export const runStaffCommand =
       }
       const map = text('map');
       if (!/^[A-Za-z0-9_]+$/.test(map)) return { content: 'Pick the map from the list.' };
-      log.info(`/voteoptions map ${map} ${onOff} by ${staff}`);
+      log.info('Staff command used', { command: 'voteoptions', what: 'map', map, action: onOff });
       const { changed, votable } = await records.setVoteMap(map, enabled, by, userName);
       const title = `${mapEmoji(map)}**${mapName(map)}**`;
       if (!changed) return { content: `${title} is already ${onOff} in map votes.` };
@@ -812,7 +812,7 @@ export const runStaffCommand =
       const reason = text('reason');
       if (!reason) return { content: 'Say why.' };
       const taking = options['subcommand'] === 'take';
-      log.info(`/coinadmin ${taking ? 'take' : 'give'} by ${staff}: ${logged(player)} ${amount}: ${JSON.stringify(reason)}`);
+      log.info('Staff command used', { command: 'coinadmin', action: taking ? 'take' : 'give', count: amount });
       const balance = await records.coinsAdjust({ ...player, delta: taking ? -amount : amount, reason, by, ...named });
       if (balance === null) return { content: 'INITcoins are not on (COINS in wrangler.jsonc).' };
       return { content: `🪙 ${taking ? 'Took' : 'Gave'} ${amount.toLocaleString('en-GB')} INITcoins ${taking ? 'from' : 'to'} ${who(player)}. They now have ${balance.toLocaleString('en-GB')}.` };
@@ -823,7 +823,7 @@ export const runStaffCommand =
       const { player } = found;
       if (options['subcommand'] === 'remove') {
         const reason = text('reason');
-        log.info(`/vip remove by ${staff}: ${logged(player)}${reason ? `: ${JSON.stringify(reason)}` : ''}`);
+        log.info('Staff command used', { command: 'vip', action: 'remove' });
         const { outcome } = await records.vipRemove({ ...player, ...(reason ? { reason } : {}), by, ...named });
         if (outcome === 'staff-spot') {
           return {
@@ -846,7 +846,7 @@ export const runStaffCommand =
       if (days !== null && (!Number.isFinite(days) || days < 1 || days > VIP_MAX_DAYS)) {
         return { content: `Give VIP for 1 to ${VIP_MAX_DAYS} days, or set permanent to True.` };
       }
-      log.info(`/vip add by ${staff}: ${logged(player)} ${days === null ? 'permanently' : `for ${days} days`}: ${JSON.stringify(reason)}`);
+      log.info('Staff command used', { command: 'vip', action: 'add', days });
       const result = await records.vipAdd({ ...player, days, reason, by, ...named });
       if (result.outcome === 'already-reserved') {
         return { content: `${who(player)} already has a permanent whitelist slot, with no end date. Nothing changed.` };
@@ -913,7 +913,7 @@ const runRotations = async (
   const sub = options['subcommand'] ?? 'show';
   const typed = (options['rotation'] ?? '').trim();
   const edit = async (change: RotationEdit): Promise<RotationEditResult> => {
-    log.info(`/rotations ${sub} by ${staff}: ${JSON.stringify(change)}`);
+    log.info('Staff command used', { command: 'rotations', action: sub });
     return records.editRotations(change, by, byName);
   };
   // Names for modes and lighting, and for the zones of each map, when the server gives them.

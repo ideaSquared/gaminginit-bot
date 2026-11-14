@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { initialState, isQuiet, step, type AlertKind, type MonitorState } from './alerts.ts';
 import type { Config } from './config.ts';
+import type { Log } from './log.ts';
 import { buildMatchSummary, buildMessage, type DiscordMessage } from './discord.ts';
 import { DEFAULT_LINES, type Lines } from './lines.ts';
 import type { LiveMatch } from './live.ts';
@@ -56,8 +57,6 @@ import {
   type SeedingTally,
 } from './tracking.ts';
 
-type Logger = { info: (message: string) => void; error: (message: string) => void };
-
 export type BotState = {
   alerts: MonitorState;
   seeding: SeedingTally;
@@ -96,7 +95,7 @@ type PollerDeps = {
   fetchSnapshot: () => Promise<Snapshot>;
   send: (message: DiscordMessage) => Promise<void>;
   now: () => number;
-  log: Logger;
+  log: Log;
   store: StateStore;
   stats?: StatsSink;
   // Sends a message to everyone in game.
@@ -270,7 +269,6 @@ export const memoryStore = (initial: BotState | null = null): StateStore => {
   };
 };
 
-const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const steamIds = (players: Player[]): string[] => players.map((p) => p.steamId);
 
@@ -282,23 +280,23 @@ export const JOIN_CHECK_MS = 5_000;
 const canSeedMessage = (seeding: boolean, players: number, live: number): boolean => seeding && players > 0 && players < live;
 
 // The in-game lines. If staff's can't be read, the bot's own go out, so a message is never lost to it.
-const readLines = async (lines: (() => Promise<Lines>) | undefined, log: Logger): Promise<Lines> => {
+const readLines = async (lines: (() => Promise<Lines>) | undefined, log: Log): Promise<Lines> => {
   if (lines === undefined) return DEFAULT_LINES;
   try {
     return await lines();
   } catch (error) {
-    log.error(`Reading the in-game lines failed, so the bot's own are used: ${errorText(error)}`);
+    log.error("Reading the in-game lines failed, so the bot's own are used", {}, error);
     return DEFAULT_LINES;
   }
 };
 
 // The kill feed's word on the match. If it can't be read, the check goes on as without the feed.
-const readFeed = async (matchFeed: (() => Promise<MatchFeed | null>) | undefined, log: Logger): Promise<MatchFeed | null> => {
+const readFeed = async (matchFeed: (() => Promise<MatchFeed | null>) | undefined, log: Log): Promise<MatchFeed | null> => {
   if (matchFeed === undefined) return null;
   try {
     return await matchFeed();
   } catch (error) {
-    log.error(`Reading the kill feed's match failed, so the check goes on without it: ${errorText(error)}`);
+    log.error("Reading the kill feed's match failed, so the check goes on without it", {}, error);
     return null;
   }
 };
@@ -323,7 +321,7 @@ const congratulate = async (
     try {
       live = await liveMatch(match);
     } catch (error) {
-      log.error(`Reading the kill feed's match failed, so its awards are left out: ${errorText(error)}`);
+      log.error("Reading the kill feed's match failed, so its awards are left out", {}, error);
     }
   }
   let extras = NO_EXTRAS;
@@ -331,7 +329,7 @@ const congratulate = async (
     try {
       extras = await endExtras(match);
     } catch (error) {
-      log.error(`Reading the records for the end of the match failed, so milestones and personal bests are left out: ${errorText(error)}`);
+      log.error('Reading the records for the end of the match failed, so milestones and personal bests are left out', {}, error);
     }
   }
   const sent = matchEndMessages(match, live, new Set(steamIds(players)), hidden, rule, random, wording, recent, extras);
@@ -340,16 +338,15 @@ const congratulate = async (
     try {
       await milestonesTold(sent.milestones);
     } catch (error) {
-      log.error(`Saving the milestones told failed: ${errorText(error)}`);
+      log.error('Saving the milestones told failed', {}, error);
     }
   }
-  for (const { steamId, name, text } of sent.messages) {
-    const who = `${JSON.stringify(name)} (${steamId})`;
+  for (const { steamId, text } of sent.messages) {
     try {
       await messagePlayer(steamId, text);
-      log.info(`Sent end-of-match message to ${who}: ${text}`);
+      log.info('End-of-match message sent');
     } catch (error) {
-      log.error(`End-of-match message to ${who} failed: ${errorText(error)}`);
+      log.error('End-of-match message failed', {}, error);
     }
   }
   return sent.recent;
@@ -392,7 +389,7 @@ export const createPoller = ({
     try {
       await record(stats);
     } catch (error) {
-      log.error(`Stats update failed: ${errorText(error)}`);
+      log.error('Stats update failed', {}, error);
     }
   };
 
@@ -413,7 +410,7 @@ export const createPoller = ({
       try {
         linkedIds = await linked();
       } catch (error) {
-        log.error(`Reading who linked their Discord account failed, so welcomes still give the invite: ${errorText(error)}`);
+        log.error('Reading who linked their Discord account failed, so welcomes still give the invite', {}, error);
       }
     }
     // Players on the leaderboard are welcomed back with their place.
@@ -422,7 +419,7 @@ export const createPoller = ({
       try {
         places = await ranks();
       } catch (error) {
-        log.error(`Reading the leaderboard failed, so welcomes leave it out: ${errorText(error)}`);
+        log.error('Reading the leaderboard failed, so welcomes leave it out', {}, error);
       }
     }
     // Regulars who have not linked their account are asked to.
@@ -431,7 +428,7 @@ export const createPoller = ({
       try {
         nudging = await nudges();
       } catch (error) {
-        log.error(`Reading who to ask to link their account failed, so welcomes leave it out: ${errorText(error)}`);
+        log.error('Reading who to ask to link their account failed, so welcomes leave it out', {}, error);
       }
     }
     const asked: string[] = [];
@@ -447,19 +444,18 @@ export const createPoller = ({
       const text = pick.text;
       lately = remember(lately, pick);
       if (pick.list === 'linkNudge') asked.push(steamId);
-      const who = `${JSON.stringify(name)} (${steamId})`;
       try {
         await messagePlayer(steamId, text);
-        log.info(`Sent welcome to ${who}: ${text}`);
+        log.info('Welcome sent');
       } catch (error) {
-        log.error(`Welcome to ${who} failed: ${errorText(error)}`);
+        log.error('Welcome failed', {}, error);
       }
     }
     if (asked.length > 0 && nudged !== undefined) {
       try {
         await nudged(asked);
       } catch (error) {
-        log.error(`Saving who was asked to link their account failed: ${errorText(error)}`);
+        log.error('Saving who was asked to link their account failed', {}, error);
       }
     }
     return { watch: markWelcomed(watched, due, time), recent: lately };
@@ -470,13 +466,12 @@ export const createPoller = ({
   const thankSeeders = async (credits: SeedCredit[], players: Player[], staffIds: ReadonlySet<string>, wording: Lines, recent: Recent) => {
     if (credits.length === 0 || config.seedingMessages === null || messagePlayer === undefined) return recent;
     const sent = seederThanks(credits, new Set(steamIds(players)), staffIds, config.seedMinutes, random, wording, recent, config.coins === null || config.seedingMessages.siteHost === null ? undefined : { siteHost: config.seedingMessages.siteHost });
-    for (const { steamId, name, text } of sent.messages) {
-      const who = `${JSON.stringify(name)} (${steamId})`;
+    for (const { steamId, text } of sent.messages) {
       try {
         await messagePlayer(steamId, text);
-        log.info(`Sent seeding thanks to ${who}: ${text}`);
+        log.info('Seeding thanks sent');
       } catch (error) {
-        log.error(`Seeding thanks to ${who} failed: ${errorText(error)}`);
+        log.error('Seeding thanks failed', {}, error);
       }
     }
     return sent.recent;
@@ -488,7 +483,7 @@ export const createPoller = ({
     try {
       await tellOutage(event);
     } catch (error) {
-      log.error(`Outage post failed: ${errorText(error)}`);
+      log.error('Outage post failed', {}, error);
     }
   };
 
@@ -510,7 +505,7 @@ export const createPoller = ({
       try {
         await unreachable();
       } catch (failure) {
-        log.error(`Outage check failed: ${errorText(failure)}`);
+        log.error('Outage check failed', {}, failure);
       }
       throw error;
     }
@@ -543,7 +538,7 @@ export const createPoller = ({
         endMessages: null,
         seedThanked: false,
       });
-      log.info(`Watching "${status.name}": ${status.players}/${status.maxPlayers} players (${alerts.phase})`);
+      log.info('Watching the server', { players: status.players, maxPlayers: status.maxPlayers, phase: alerts.phase });
       await report((sink) => sink.check({ at: time, status, players, phase: alerts.phase, seeding: seedingNow, match }));
       return;
     }
@@ -639,9 +634,9 @@ export const createPoller = ({
     if (message !== null && broadcast !== undefined) {
       try {
         await broadcast(message);
-        log.info(`Sent in game: ${message}`);
+        log.info('In-game message sent');
       } catch (error) {
-        log.error(`In-game message failed: ${errorText(error)}`);
+        log.error('In-game message failed', {}, error);
       }
     }
 
@@ -680,7 +675,7 @@ export const createPoller = ({
         await send(buildMatchSummary({ ...summary, top: publicNames(summary.top, hidden) }, status.name, config.siteUrl));
         // So a failed alert below does not post the summary a second time.
         tracked = { ...tracked, unsentSummary: null };
-        log.info(`Sent match summary for ${summary.map}`);
+        log.info('Match summary sent', { map: summary.map });
       }
       if (result.alert !== null) {
         // At night the seeding and low-pop alerts ping nobody: the server dying down then is everyone going to bed, and
@@ -698,7 +693,7 @@ export const createPoller = ({
             serverId: config.serverId,
           }),
         );
-        log.info(`Sent ${result.alert} alert at ${status.players}/${status.maxPlayers} players${quiet ? ' (night: no ping)' : ''}`);
+        log.info('Alert sent', { kind: result.alert, players: status.players, maxPlayers: status.maxPlayers, quiet: Boolean(quiet) });
         const kind = result.alert;
         await report(async (sink) => sink.alerted?.(kind, time));
       }
@@ -728,7 +723,7 @@ export const createPoller = ({
     try {
       await check();
     } catch (error) {
-      log.error(`Check failed: ${errorText(error)}`);
+      log.error('Check failed', {}, error);
     }
   };
 };
@@ -738,7 +733,7 @@ type JoinCheckDeps = {
   fetchPlayers: () => Promise<Player[]>;
   broadcast: (message: string) => Promise<void>;
   now: () => number;
-  log: Logger;
+  log: Log;
   store: StateStore;
   random?: () => number;
   lines?: () => Promise<Lines>;
@@ -767,14 +762,14 @@ export const createJoinCheck =
       const message = pick.text;
       try {
         await broadcast(message);
-        log.info(`Sent in game: ${message}`);
+        log.info('In-game message sent');
       } catch (error) {
-        log.error(`In-game message failed: ${errorText(error)}`);
+        log.error('In-game message failed', {}, error);
       }
       await store.save({ ...state, joins: { ...watched, lastJoinAt: null }, seedMessageAt: time, recent: remember(state.recent, pick) });
       return true;
     } catch (error) {
-      log.error(`Join check failed: ${errorText(error)}`);
+      log.error('Join check failed', {}, error);
       return true;
     }
   };
@@ -808,7 +803,7 @@ export const createFeedJoins =
       if (changed) await store.save({ ...state, joins: watched });
       return watched.lastJoinAt === null ? null : watched.lastJoinAt + JOIN_WAIT_MS;
     } catch (error) {
-      log.error(`Noting the kill feed's joins failed: ${errorText(error)}`);
+      log.error("Noting the kill feed's joins failed", {}, error);
       return null;
     }
   };
@@ -866,6 +861,6 @@ export const createMatchEndCheck =
       );
       await store.save({ ...state, ...(finished === null ? { match } : {}), endMessages: ending.startedAt, recent });
     } catch (error) {
-      log.error(`Match end check failed: ${errorText(error)}`);
+      log.error('Match end check failed', {}, error);
     }
   };

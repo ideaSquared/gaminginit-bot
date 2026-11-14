@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { memoryLog } from './memory-log.ts';
 import {
   closeTicket,
   handleTicket,
@@ -192,7 +193,9 @@ describe('privacy', () => {
 });
 
 describe('failures', () => {
-  const log = { error: vi.fn() };
+  const { log, events } = memoryLog();
+  const errorsAbout = (text: string) =>
+    expect.objectContaining({ level: 'error', message: 'Ticket action failed', error: expect.objectContaining({ message: expect.stringContaining(text) }) });
   it('tells the person when the bot lacks permissions, without leaking details', async () => {
     const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) =>
       init?.method === 'GET' ? json([]) : json({ code: 50013, message: 'Missing Permissions' }, 403)) as typeof fetch;
@@ -202,7 +205,7 @@ describe('failures', () => {
     expect(edit).toHaveBeenCalledWith({ content: expect.stringContaining('missing permissions in the ticket category') });
     expect(edit).toHaveBeenCalledWith({ content: expect.stringContaining('Discord 50013') });
     // The log keeps the operation, status and Discord's answer.
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('creating the ticket channel: 403 {"code":50013'));
+    expect(events).toContainEqual(errorsAbout('creating the ticket channel: 403 {"code":50013'));
   });
 
   it('says a private channel could not be made when it is exposed', async () => {
@@ -214,12 +217,12 @@ describe('failures', () => {
     expect(edit).toHaveBeenCalledWith({ content: expect.stringContaining("couldn't make it private") });
     // Who the channel was shown to is for the log only.
     expect(JSON.stringify(edit.mock.calls)).not.toContain('@everyone');
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('was not private: the channel is not hidden from @everyone'));
+    expect(events).toContainEqual(errorsAbout('was not private: the channel is not hidden from @everyone'));
   });
 });
 
 describe('claiming', () => {
-  const log = { error: vi.fn() };
+  const { log } = memoryLog();
   const edit = vi.fn(async () => undefined);
   const details = { title: 'Ban appeal', type: 'rich', fields: [{ name: 'Why', value: 'Sorry', inline: false }] };
   const claimed = (id: string) => ({ ...details, fields: [...details.fields, { name: 'Claimed by', value: `<@${id}>`, inline: false }] });
@@ -370,7 +373,7 @@ describe('closeTicket', () => {
 });
 
 describe('handleTicket', () => {
-  const log = { error: vi.fn() };
+  const { log, events } = memoryLog();
   const edit = vi.fn(async () => undefined);
 
   it('says tickets are off without settings', async () => {
@@ -404,6 +407,6 @@ describe('handleTicket', () => {
     expect(result.body).toMatchObject({ type: 5, data: { flags: 64 } });
     await result.followUp?.();
     expect(edit).toHaveBeenCalledWith({ content: expect.not.stringContaining('secret') });
-    expect(log.error).toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({ level: 'error', message: 'Ticket action failed' }));
   });
 });

@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import { coinsText, type CoinReply, type CoinsAccountView, type MissionView } from './coins.ts';
 import type { Config } from './config.ts';
 import {
@@ -53,7 +54,7 @@ type CommandDeps = {
   seedCall: (message: DiscordMessage) => Promise<void>;
   records: StaffRecords;
   now: () => number;
-  log: { info: (message: string) => void };
+  log: Log;
 };
 
 // /lastmatch works without the RCON settings, so settings that fail to load only cost it the website link.
@@ -193,9 +194,7 @@ export const runCommand =
       const endedAt = Number(options['match']);
       const removed = Number.isFinite(endedAt) ? await removeMatch(endedAt) : null;
       if (removed === null) return { content: "That isn't one of the recent matches. Pick one from the list." };
-      log.info(
-        `/removematch by Discord user ${userId ?? 'unknown'}: ${removed.match.map} ended ${new Date(removed.match.endedAt).toISOString()}`,
-      );
+      log.info('/removematch used', { map: removed.match.map });
       return { content: removedMatchText(removed.match, removed.players) };
     }
     if (name === 'seeders') {
@@ -215,14 +214,14 @@ export const runCommand =
     if (name === 'rotation') return { embeds: [buildRotationEmbed(await fetchRotation(rconUrl, rconPassword, http))] };
     if (name === 'seednow') {
       const note = (options['message'] ?? '').trim();
-      // Logged before anything can fail, like /broadcast, so every call has a record of who made it.
-      log.info(`/seednow requested by Discord user ${userId ?? 'unknown'}${note ? `: ${JSON.stringify(note)}` : ''}`);
+      // Logged before anything can fail, like /broadcast.
+      log.info('/seednow requested');
       const status = await fetchStatus(rconUrl, rconPassword, http);
       if (status.players >= rules.live) {
         return { content: `The server is already live (${status.players}/${status.maxPlayers} players), so no seeding call was sent.` };
       }
       await seedCall(buildSeedCall(status, { lowPop: rules.lowPop, live: rules.live, roleId, vip, ...(coinRule === null ? {} : { coins: coinRule.seed }), siteUrl, serverId, note, calledBy: userId }));
-      log.info(`/seednow posted for Discord user ${userId ?? 'unknown'} at ${status.players}/${status.maxPlayers} players`);
+      log.info('/seednow posted', { players: status.players, maxPlayers: status.maxPlayers });
       return {
         content: roleId
           ? `🌱 Seeding call posted, pinging <@&${roleId}>.`
@@ -232,11 +231,9 @@ export const runCommand =
 
     const message = (options['message'] ?? '').trim();
     if (!message) return { content: 'Nothing to send.' };
-    const sender = `Discord user ${userId ?? 'unknown'}`;
     // Logged before sending, so a send that times out after reaching the server still has a record.
-    // JSON quoting keeps line breaks in the message from faking extra log lines.
-    log.info(`/broadcast requested by ${sender}: ${JSON.stringify(message)}`);
+    log.info('/broadcast requested');
     await sendBroadcast(rconUrl, rconPassword, message, http);
-    log.info(`/broadcast delivered for ${sender}`);
+    log.info('/broadcast delivered');
     return { content: `📢 Sent in game: ${message}` };
   };

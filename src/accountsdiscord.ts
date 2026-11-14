@@ -1,3 +1,4 @@
+import { log } from './log.ts';
 import { z } from 'zod';
 import type { JoinOutcome } from './adminauth.ts';
 
@@ -47,7 +48,7 @@ export const isMember = async (botToken: string, guildId: string, userId: string
   const response = await botCall(botToken, fetchFn)(`/guilds/${guildId}/members/${userId}`, 'GET');
   if (response.ok) return true;
   if (response.status === 404) return false;
-  console.error(`Player account: could not check if ${userId} is in server ${guildId}: ${response.status} ${await response.text()}`);
+  log.error('Player account: could not check if a player is in the server', { status: response.status });
   return null;
 };
 
@@ -79,11 +80,11 @@ export const sendDirectMessage = async (
 ): Promise<'sent' | 'closed'> => {
   const call = botCall(botToken, fetchFn);
   const opened = await call('/users/@me/channels', 'POST', { recipient_id: userId });
-  if (!opened.ok) throw new Error(`Discord would not open a message to ${userId}: ${opened.status} ${await opened.text()}`);
+  if (!opened.ok) throw new Error(`Discord would not open a message: ${opened.status} ${await opened.text()}`);
   const { id } = z.object({ id: z.string() }).parse(await opened.json());
   const sent = await call(`/channels/${id}/messages`, 'POST', { content, allowed_mentions: { parse: [] } });
   if (sent.ok) return 'sent';
   const code = z.object({ code: z.number() }).safeParse(await sent.json().catch(() => null));
   if (sent.status === 403 && code.success && code.data.code === DMS_CLOSED) return 'closed';
-  throw new Error(`Discord refused the message to ${userId}: ${sent.status}`);
+  throw new Error(`Discord refused the message: ${sent.status}`);
 };

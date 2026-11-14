@@ -434,8 +434,11 @@ describe('the Worker in workerd', { timeout: 30_000 }, () => {
       expect(posts.filter((r) => r === `POST /v1/players/${BO}/message`)).toHaveLength(1);
       expect(posts.filter((r) => r === 'POST /v1/bans')).toHaveLength(1);
       const logs = server.getLogs().map((log) => log.message);
-      expect(logs.some((m) => m.includes(`Chat moderation: banned "Ash" (${ASH})`))).toBe(true);
-      expect(logs.some((m) => m.includes(`Chat moderation: warned "Bo" (${BO})`))).toBe(true);
+      expect(logs.some((m) => m.includes('"message":"Chat moderation: banned"'))).toBe(true);
+      expect(logs.some((m) => m.includes('"message":"Chat moderation: warned"'))).toBe(true);
+      // No player, Steam ID or chat line reaches the logs: names are checked bare, since quotes are escaped in JSON.
+      const secrets = [ASH, BO, 'Ash', 'Bo', ...rcon.chat.map((line) => line.message)];
+      for (const m of logs) for (const secret of secrets) expect(m).not.toContain(secret);
       expect(errors()).toEqual([]);
 
       // The next check asks after the newest line, and acts on nothing again.
@@ -524,6 +527,34 @@ describe('the Worker in workerd', { timeout: 30_000 }, () => {
       const feed = await json('/api/admin/chat?after=8', { headers: { authorization: `Bearer ${session}` } });
       expect(feed.body.lines.find((l: { id: number }) => l.id === 9)).toMatchObject({ reply: 'cheat' });
       expect(errors()).toEqual([]);
+    });
+  });
+
+  describe('staff actions in the logs', () => {
+    const STAFF_A = '100000000000000003';
+    const STAFF_B = '100000000000000004';
+    const useChat = async (id: string) => {
+      const headers = { authorization: `Bearer ${await createSession(CLIENT_SECRET, { id, name: 'Name' + id.slice(-1) }, Date.now())}`, 'content-type': 'application/json' };
+      const reply = await json('/api/admin/command', { method: 'POST', headers, body: JSON.stringify({ name: 'chat', options: { player: 'bo' } }) });
+      expect(reply.status).toBe(200);
+    };
+    const used = () =>
+      server
+        .getLogs()
+        .flatMap((entry) => (entry.message.startsWith('{') ? [JSON.parse(entry.message) as { message: string; meta?: { actor?: string } }] : []))
+        .filter((event) => event.message === 'Staff page: command used');
+
+    it('tags each staff action with a stable anonymous actor, different for each staff member, never their Discord ID', async () => {
+      const before = used().length;
+      await useChat(STAFF_A);
+      await useChat(STAFF_A);
+      await useChat(STAFF_B);
+      const [a1, a2, b1] = used().slice(before).map((event) => event.meta?.actor);
+      expect(a1).toMatch(/^[0-9a-f]{12}$/);
+      expect(a2).toBe(a1);
+      expect(b1).toMatch(/^[0-9a-f]{12}$/);
+      expect(b1).not.toBe(a1);
+      for (const entry of server.getLogs()) for (const secret of [STAFF_A, STAFF_B, 'Name3', 'Name4']) expect(entry.message).not.toContain(secret);
     });
   });
 

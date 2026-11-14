@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import { z } from 'zod';
 import type { VipRule } from './config.ts';
 import { appendSection, refusal, sectionLines, sectionRange } from './ini.ts';
@@ -216,12 +217,11 @@ type VipDeps = {
     validate: (text: string) => Promise<ConfigResult>;
     put: (config: ServerConfig) => Promise<ConfigResult>;
   };
-  log: { info: (message: string) => void };
+  log: Log;
 };
 
 const refused = (result: ConfigResult): string | null => refusal(result, 'DefaultReservedPlayerIds');
 
-const names = (players: Named[]): string => players.map((p) => `${p.name} (${p.steamId})`).join(', ');
 
 type VipRcon = VipDeps['rcon'];
 
@@ -262,25 +262,15 @@ export const syncVip = async ({ rule, days, state, now, staff = new Map(), rcon,
     added: plan.add,
     renewed: plan.renewed,
   });
-  if (plan.renewed.length > 0) log.info(`VIP renewed: ${names(plan.renewed)}.`);
-  if (spots.adopted.length > 0) log.info(`Staff spots taken over from the whitelist: ${names(spots.adopted)}.`);
+  if (plan.renewed.length > 0) log.info('VIP renewed', { count: plan.renewed.length });
+  if (spots.adopted.length > 0) log.info('Staff spots taken over from the whitelist', { count: spots.adopted.length });
   const add = [...plan.add, ...spots.add].map((p) => p.steamId);
   const remove = [...plan.remove, ...spots.remove];
   if (add.length === 0 && remove.length === 0) return done();
 
   await writeReserved(rcon, config, add, remove);
 
-  const removed = plan.remove.map((steamId) => ({ steamId, name: state.granted[steamId]?.name ?? 'unknown' }));
-  const spotsEnded = spots.remove.map((steamId) => ({ steamId, name: state.staffSpots[steamId]?.name ?? 'unknown' }));
-  log.info(
-    [
-      ...(plan.add.length > 0 ? [`VIP added: ${names(plan.add)}.`] : []),
-      ...(removed.length > 0 ? [`VIP ended: ${names(removed)}.`] : []),
-      ...(spots.add.length > 0 ? [`Staff spots added: ${names(spots.add)}.`] : []),
-      ...(spotsEnded.length > 0 ? [`Staff spots ended: ${names(spotsEnded)}.`] : []),
-      'The server uses the new whitelist after its next restart.',
-    ].join(' '),
-  );
+  log.info('Whitelist updated, and used after the next server restart', { added: plan.add.length, removed: plan.remove.length, staffSpotsAdded: spots.add.length, staffSpotsEnded: spots.remove.length });
   return done();
 };
 

@@ -76,7 +76,7 @@ describe('private messages', () => {
     ).resolves.toBe('closed');
     await expect(
       sendDirectMessage('t', '42', 'hi', sequence(Response.json({ id: '555' }), new Response('boom', { status: 500 }))),
-    ).rejects.toThrow('Discord refused the message to 42: 500');
+    ).rejects.toThrow('Discord refused the message: 500');
     await expect(sendDirectMessage('t', '42', 'hi', sequence(new Response('no', { status: 403 })))).rejects.toThrow('would not open a message');
   });
 });

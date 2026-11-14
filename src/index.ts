@@ -1,17 +1,12 @@
 import { loadConfig } from './config.ts';
 import { postWebhook } from './discord.ts';
+import { log } from './log.ts';
 import { createJoinCheck, createPoller, JOIN_CHECK_MS, memoryStore } from './poller.ts';
 import { fetchHttp, fetchPlayers, fetchSnapshot, messagePlayer, sendBroadcast } from './rcon.ts';
 
 const config = loadConfig(process.env);
 
-const timestamped =
-  (write: (line: string) => void) =>
-  (message: string): void =>
-    write(`${new Date().toISOString()} ${message}`);
-
 const store = memoryStore();
-const log = { info: timestamped(console.log), error: timestamped(console.error) };
 const broadcast = (message: string) => sendBroadcast(config.rconUrl, config.rconPassword, message, fetchHttp());
 
 const poll = createPoller({

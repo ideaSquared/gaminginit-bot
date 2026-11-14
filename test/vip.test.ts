@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { VipRule } from '../src/config.ts';
 import type { PlayerDay, PlayerTotals } from '../src/players.ts';
 import type { ConfigResult, ServerConfig } from '../src/rcon.ts';
+import { lines, memoryLog } from './memory-log.ts';
 import {
   addVip,
   editReserved,
@@ -291,7 +292,8 @@ describe('syncVip', () => {
     };
   };
   const earned: PlayerDay[] = [{ [ASH]: row('Ash', 3) }];
-  const log = { info: vi.fn() };
+  const { log, events } = memoryLog();
+  const WHITELIST = 'Whitelist updated, and used after the next server restart';
 
   it('checks the result, then writes the new list against the revision it read', async () => {
     const rcon = server();
@@ -306,9 +308,8 @@ describe('syncVip', () => {
     const written = editReserved(settings, [ASH], []);
     expect(rcon.validate).toHaveBeenCalledWith(written);
     expect(rcon.put).toHaveBeenCalledWith({ revision: '4', writable: true, text: written });
-    expect(log.info).toHaveBeenCalledWith(
-      `VIP added: Ash (${ASH}). The server uses the new whitelist after its next restart.`,
-    );
+    expect(lines(events)).toContainEqual([WHITELIST, { added: 1, removed: 0, staffSpotsAdded: 0, staffSpotsEnded: 0 }]);
+    expect(JSON.stringify(events)).not.toContain(ASH);
   });
 
   it('keeps working when the list starts with !DefaultReservedPlayerIds=ClearArray', async () => {
@@ -332,7 +333,7 @@ describe('syncVip', () => {
 
     expect(rcon.put).toHaveBeenCalledWith({ revision: '4', writable: true, text: settings });
     expect(result).toEqual({ state: { granted: {}, checkedAt: NOW, revoked: {}, staffSpots: {} }, added: [], renewed: [] });
-    expect(log.info).toHaveBeenCalledWith(`VIP ended: Ash (${ASH}). The server uses the new whitelist after its next restart.`);
+    expect(lines(events)).toContainEqual([WHITELIST, { added: 0, removed: 1, staffSpotsAdded: 0, staffSpotsEnded: 0 }]);
   });
 
   it('keeps a player on the list for another week if they earned it again, without writing', async () => {
@@ -366,8 +367,8 @@ describe('syncVip', () => {
       added: [],
       renewed: [],
     });
-    expect(log.info).toHaveBeenCalledWith(`Staff spots taken over from the whitelist: Sarge (${ADMIN}).`);
-    expect(log.info).toHaveBeenCalledWith(`Staff spots added: Kestrel (${BO}). The server uses the new whitelist after its next restart.`);
+    expect(lines(events)).toContainEqual(['Staff spots taken over from the whitelist', { count: 1 }]);
+    expect(lines(events)).toContainEqual([WHITELIST, { added: 0, removed: 0, staffSpotsAdded: 1, staffSpotsEnded: 0 }]);
   });
 
   it('turns VIP a staff member had from the bot into their staff spot, which does not run out', async () => {

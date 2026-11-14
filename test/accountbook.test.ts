@@ -19,6 +19,7 @@ import {
 } from '../src/accountbook.ts';
 import { ACCOUNT_WORK_KEY, accountKey, parseAccount, steamLinkKey, type AccountRule } from '../src/accounts.ts';
 import type { VipState } from '../src/vip.ts';
+import { memoryLog } from './memory-log.ts';
 
 const NOW = Date.UTC(2026, 9, 17, 12);
 const DAY = 24 * 60 * 60_000;
@@ -66,7 +67,7 @@ const vipFor = (steamId: string, over = {}): VipState => ({
   ...noVip,
   granted: { [steamId]: { name: 'x', grantedAt: NOW - DAY, expiresAt: NOW + 6 * DAY, source: 'seeding', ...over } },
 });
-const log = { info: vi.fn(), error: vi.fn() };
+const { log, events } = memoryLog();
 const deps = (storage: BookStorage, discord: Discord | null = pretend(), now = NOW, over: Partial<BookDeps> = {}): BookDeps => ({
   storage,
   now,
@@ -319,7 +320,9 @@ describe('the roles and messages pass', () => {
     await syncAccounts(deps(storage, failing), noVip, true);
     expect(accountOf(storage, ME)).toMatchObject({ roles: { linked: false }, retryAt: NOW + 15 * 60_000 });
     expect(storage.data.get(ACCOUNT_WORK_KEY)).toEqual([ME]);
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Missing Permissions'));
+    expect(events).toContainEqual(
+      expect.objectContaining({ level: 'error', message: 'Player account: changing a role failed', error: expect.objectContaining({ message: 'Missing Permissions' }) }),
+    );
 
     await syncAccounts(deps(storage, failing, NOW + 60_000), noVip, false);
     expect(failing.setRole).toHaveBeenCalledTimes(1);

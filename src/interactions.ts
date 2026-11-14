@@ -1,3 +1,4 @@
+import type { Log } from './log.ts';
 import { z } from 'zod';
 import { MAP_CHOICES, type Embed } from './discord.ts';
 import { BAN_LENGTHS } from './moderation.ts';
@@ -531,7 +532,7 @@ type InteractionDeps = {
   // failure goes out as a follow-up only the sender sees.
   deleteReply: (applicationId: string, token: string) => Promise<void>;
   privateFollowUp: (applicationId: string, token: string, reply: Reply) => Promise<void>;
-  log: { error: (message: string) => void };
+  log: Log;
   now: () => number;
   // The only Discord server allowed to use admin commands. Commands are registered globally, so without this an
   // admin in any server that adds the app could control this game server.
@@ -541,7 +542,7 @@ type InteractionDeps = {
   // A press of a next-map vote button (see mapvote.ts): what to do with the vote. `update` is the vote message with the new
   // counts, when the vote changed; `reply` is for the voter alone. Without it, buttons are not answered.
   // `map` is a map button, `light` a time of day button, `weather` a weather button and `zone` a circles button: one of them.
-  castVote?: (press: { poll: string; map?: string; light?: string; weather?: string; userId: string; userName?: string }) => Promise<{ update: unknown | null; reply: string }>;
+  castVote?: (press: { poll: string; map?: string; light?: string; weather?: string; userId: string }) => Promise<{ update: unknown | null; reply: string }>;
   // The one server whose members may vote.
   voteGuildId?: string | undefined;
   // Support tickets (see tickets.ts). Without it the ticket buttons say tickets are not set up.
@@ -683,18 +684,18 @@ const replyPrivately = async (
   try {
     await deps.deleteReply(applicationId, token);
   } catch (error) {
-    deps.log.error(`/${name} could not delete the public reply: ${errorText(error)}`);
+    deps.log.error('Command could not delete the public reply', { command: name }, error);
     try {
       await deps.editReply(applicationId, token, reply);
       return;
     } catch (editError) {
-      deps.log.error(`/${name} could not edit the public reply either: ${errorText(editError)}`);
+      deps.log.error('Command could not edit the public reply either', { command: name }, editError);
     }
   }
   try {
     await deps.privateFollowUp(applicationId, token, reply);
   } catch (error) {
-    deps.log.error(`/${name} private failure reply failed: ${errorText(error)}`);
+    deps.log.error('Command private failure reply failed', { command: name }, error);
     throw error;
   }
 };
@@ -722,9 +723,7 @@ const handleVotePress = async (interaction: z.infer<typeof InteractionSchema>, d
   }
   const token = interaction.token;
   try {
-    // The name is only for the log of who voted for what.
-    const userName = interaction.member?.nick || interaction.member?.user?.global_name || interaction.member?.user?.username;
-    const { update, reply } = await deps.castVote({ ...press, userId, ...(userName ? { userName } : {}) });
+    const { update, reply } = await deps.castVote({ ...press, userId });
     if (update === null) return { status: 200, body: privateMessage(reply) };
     return {
       status: 200,
@@ -732,7 +731,7 @@ const handleVotePress = async (interaction: z.infer<typeof InteractionSchema>, d
       followUp: () => deps.privateFollowUp(interaction.application_id, token, { content: reply, allowed_mentions: { parse: [] } }),
     };
   } catch (error) {
-    deps.log.error(`A vote press failed: ${errorText(error)}`);
+    deps.log.error('A vote press failed', {}, error);
     return { status: 200, body: privateMessage('Your vote could not be counted. Try again.') };
   }
 };
@@ -821,7 +820,7 @@ export const handleInteraction = async (
           isAdmin(interaction.member, deps.adminRoleIds)));
     const choices = allowed
       ? await deps.suggest(toRequest(name)).catch((error: unknown) => {
-          deps.log.error(`/${name} suggestions failed: ${errorText(error)}`);
+          deps.log.error('Command suggestions failed', { command: name }, error);
           return [];
         })
       : [];
@@ -868,7 +867,7 @@ export const handleInteraction = async (
     const reply: Reply = await deps.runCommand(request).then(
       (result) => ({ ...result, allowed_mentions: { parse: [] } }),
       (error: unknown) => {
-        deps.log.error(`/${name} failed: ${errorText(error)}`);
+        deps.log.error('Command failed', { command: name }, error);
         failed = true;
         return { content: failureText(name, error), allowed_mentions: { parse: [] } };
       },

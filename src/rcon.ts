@@ -116,6 +116,11 @@ const errorBody = (body: string): { code: string | null; message: string | null 
 export const isNotInGame = (error: unknown): boolean =>
   error instanceof RconError && error.status === 404 && error.code === 'player_not_found';
 
+// Errors end up in logs and staff replies, so a Steam ID in a path (/v1/players/<id>/message) is shown as :id.
+const STEAM_ID_IN_PATH = /\/\d{17}(?=[/?]|$)/g;
+const STEAM_ID_IN_TEXT = /\b\d{17}\b/g;
+const routeOf = (path: string): string => path.replace(STEAM_ID_IN_PATH, '/:id');
+
 const rconRequest = async (
   rconUrl: string,
   password: string,
@@ -134,9 +139,9 @@ const rconRequest = async (
   }
   if (response.status < 200 || response.status >= 300) {
     const { code, message } = errorBody(response.body);
-    const said = [code, message].filter((part) => part !== null).join(': ');
+    const said = [code, message].filter((part) => part !== null).join(': ').replace(STEAM_ID_IN_TEXT, ':id');
     throw new RconError(
-      `RCON request failed: ${write?.method ?? 'GET'} ${path} ${response.status}${said ? ` (${said})` : ''}`,
+      `RCON request failed: ${write?.method ?? 'GET'} ${routeOf(path)} ${response.status}${said ? ` (${said})` : ''}`,
       response.status,
       code,
     );
@@ -197,7 +202,7 @@ export const sendBroadcast = async (rconUrl: string, password: string, message: 
 const STEAM_ID = /^\d{17}$/;
 
 const playerPath = (steamId: string, action = ''): string => {
-  if (!STEAM_ID.test(steamId)) throw new Error(`Not a Steam ID: ${steamId}`);
+  if (!STEAM_ID.test(steamId)) throw new Error('Not a Steam ID');
   return `/v1/players/${steamId}${action}`;
 };
 
@@ -236,13 +241,13 @@ export const fetchBans = async (rconUrl: string, password: string, http: HttpCli
 // Bans are permanent on the server (they go into ServerSettings.ini); the bot lifts timed ones itself. The game only
 // bans a player who is in game: anyone else is refused with 404 player_not_found (see isNotInGame).
 export const addBan = async (rconUrl: string, password: string, steamId: string, reason: string, http: HttpClient) => {
-  if (!STEAM_ID.test(steamId)) throw new Error(`Not a Steam ID: ${steamId}`);
+  if (!STEAM_ID.test(steamId)) throw new Error('Not a Steam ID');
   await rconRequest(rconUrl, password, '/v1/bans', http, json('POST', { steamId, reason }));
 };
 
 // False when the player was not banned.
 export const removeBan = async (rconUrl: string, password: string, steamId: string, http: HttpClient): Promise<boolean> => {
-  if (!STEAM_ID.test(steamId)) throw new Error(`Not a Steam ID: ${steamId}`);
+  if (!STEAM_ID.test(steamId)) throw new Error('Not a Steam ID');
   try {
     await rconRequest(rconUrl, password, `/v1/bans/${steamId}`, http, { method: 'DELETE' });
     return true;
