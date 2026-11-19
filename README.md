@@ -1,5 +1,11 @@
 # WARDOGS Discord bot
 
+> **gaminginit closed on 24 November 2026, and this bot is switched off.** The every-minute check (the cron trigger in
+> `wrangler.jsonc`) is removed, so it no longer reads the game server or posts to Discord. The code is kept as it was.
+> To run it again, put `"* * * * *"` back in `crons` and deploy. To remove it completely, delete the Worker in
+> Cloudflare (Workers & Pages → wardogs-discord-bot → Settings → Delete): that also deletes its saved data, including
+> linked player accounts, and cannot be undone. The website no longer uses the bot.
+
 Watches a WARDOGS server through its RCON API and posts to a Discord channel when:
 
 | Alert        | When                                                       | Default     |
