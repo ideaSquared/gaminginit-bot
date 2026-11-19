@@ -3,8 +3,10 @@
   "name": "wardogs-discord-bot",
   "main": "src/worker.ts",
   "compatibility_date": "2026-09-30",
+  // gaminginit closed on 24 November 2026, so the every-minute check is off. To run the bot again, put
+  // "* * * * *" back in this list and deploy.
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": []
   },
   "durable_objects": {
     "bindings": [{ "name": "WATCHER", "class_name": "Watcher" }]
